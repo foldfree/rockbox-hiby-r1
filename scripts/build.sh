@@ -271,6 +271,9 @@ log "building firmware"
   cd "$FW_BUILD_DIR"
   "$UPSTREAM_DIR/tools/configure" --target=hibyr1 --type=n
   make -j"$BUILD_JOBS"
+  # Package the full .rockbox tree (plugins, codecs, themes, fonts, data)
+  # into rockbox.zip so installs get an API-matched plugin/codec set.
+  make -j"$BUILD_JOBS" zip
 )
 
 log "building bootloader"
