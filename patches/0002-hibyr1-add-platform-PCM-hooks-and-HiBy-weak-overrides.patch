@@ -1,0 +1,191 @@
+From 8bfd7898a4affc646e56d30324cb5ae9e6c2b775 Mon Sep 17 00:00:00 2001
+From: test <test@example.invalid>
+Date: Sun, 31 May 2026 20:24:50 +0100
+Subject: [PATCH 3/5] hibyr1: add platform PCM hooks and HiBy weak overrides
+
+Introduce weak symbol hooks in pcm-alsa.c to allow platforms to customize
+ALSA behavior without fragmenting the shared backend with #ifdefs.
+
+Hooks allow customization of:
+- Buffer/period sizing per device type
+- Start threshold for different latency profiles
+- Device lifecycle management (open/close hooks)
+- Poll interval calculation for custom poll threads
+
+HiBy implementation provides overrides for Bluetooth (BlueALSA) support:
+- Larger buffers for wireless latency
+- Custom poll thread instead of async callbacks
+- Device-specific start thresholds
+
+This eliminates all HIBY_LINUX conditionals from pcm-alsa.c while keeping
+platform logic isolated in overlay files.
+
+Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+---
+ firmware/SOURCES                  |  3 +
+ firmware/target/hosted/pcm-alsa.c | 91 +++++++++++++++++++++++++++++--
+ 2 files changed, 90 insertions(+), 4 deletions(-)
+
+diff --git a/firmware/SOURCES b/firmware/SOURCES
+index 20158f8489..262369dc0b 100644
+--- a/firmware/SOURCES
++++ b/firmware/SOURCES
+@@ -149,6 +149,9 @@ target/hosted/sonynwz/nwzlinux-codec.c
+ #if ((defined(HIBY_LINUX) || defined(FIIO_M3K_LINUX) || defined(SAMSUNG_YPR0) || defined(SAMSUNG_YPR1) || defined(SONY_NWZ_LINUX)) && !defined(SIMULATOR))
+ target/hosted/pcm-alsa.c
+ target/hosted/alsa-controls.c
++#if (defined(HIBY_LINUX) && !defined(SIMULATOR))
++target/hosted/hiby/pcm-alsa-hiby.c
++#endif
+ #endif
+ #endif
+ 
+diff --git a/firmware/target/hosted/pcm-alsa.c b/firmware/target/hosted/pcm-alsa.c
+index 7e4833fdfe..229855dbb2 100644
+--- a/firmware/target/hosted/pcm-alsa.c
++++ b/firmware/target/hosted/pcm-alsa.c
+@@ -111,6 +111,79 @@ static snd_pcm_stream_t current_alsa_mode;  /* SND_PCM_STREAM_PLAYBACK / _CAPTUR
+ 
+ static const char *current_alsa_device;
+ 
++void pcm_alsa_pump_locked(snd_pcm_t *handle);
++
++#ifndef _WIN32
++__attribute__((weak)) void pcm_alsa_adjust_buffering(snd_pcm_sframes_t *period_size,
++                                                      snd_pcm_sframes_t *buffer_size,
++                                                      const char *device)
++{
++    /* Default: no adjustment */
++    (void)period_size;
++    (void)buffer_size;
++    (void)device;
++}
++
++__attribute__((weak)) unsigned int pcm_alsa_calc_poll_interval(snd_pcm_sframes_t period_size,
++                                                                unsigned int sample_rate)
++{
++    /* Default: half the period duration in ms */
++    return (period_size * 500) / sample_rate;
++}
++
++__attribute__((weak)) snd_pcm_uframes_t pcm_alsa_start_threshold(snd_pcm_sframes_t buffer_size,
++                                                                   snd_pcm_sframes_t period_size,
++                                                                   const char *device)
++{
++    /* Default: start when buffer is half full */
++    (void)period_size;
++    (void)device;
++    return buffer_size / 2;
++}
++
++__attribute__((weak)) bool pcm_alsa_params_ready(snd_pcm_sframes_t period_size,
++                                                  snd_pcm_sframes_t buffer_size,
++                                                  sample_t *frames)
++{
++    /* Default: ready if all params are set */
++    return period_size > 0 && buffer_size > 0 && frames != NULL;
++}
++
++__attribute__((weak)) bool pcm_alsa_keep_device(snd_pcm_t *handle, const char *device,
++                                                 const char *current_device,
++                                                 snd_pcm_stream_t mode, snd_pcm_stream_t current_mode)
++{
++    /* Default: keep if same device and mode */
++    (void)handle;
++    return device == current_device
++#ifdef HAVE_RECORDING
++        && current_mode == mode
++#else
++        && true
++#endif
++        ;
++    (void)mode;
++    (void)current_mode;
++}
++
++__attribute__((weak)) void pcm_alsa_device_opened(snd_pcm_t *handle, const char *device,
++                                                   snd_pcm_stream_t mode, pthread_mutex_t *mtx)
++{
++    /* Default: no action */
++    (void)handle;
++    (void)device;
++    (void)mode;
++    (void)mtx;
++}
++
++__attribute__((weak)) void pcm_alsa_device_closing(snd_pcm_t *handle, const char *device)
++{
++    /* Default: no action */
++    (void)handle;
++    (void)device;
++}
++#endif
++
+ void pcm_alsa_set_playback_device(const char *device)
+ {
+     playback_dev = device;
+@@ -148,6 +221,8 @@ static int set_hwparams(snd_pcm_t *handle, unsigned long sampr)
+         period_size = MIX_FRAME_SAMPLES;
+     }
+ 
++    pcm_alsa_adjust_buffering(&period_size, &buffer_size, current_alsa_device);
++
+     /* choose all parameters */
+     err = snd_pcm_hw_params_any(handle, params);
+     if (err < 0)
+@@ -241,7 +316,8 @@ static int set_swparams(snd_pcm_t *handle)
+         goto error;
+     }
+     /* start the transfer when the buffer is half full */
+-    err = snd_pcm_sw_params_set_start_threshold(handle, swparams, buffer_size / 2);
++    err = snd_pcm_sw_params_set_start_threshold(handle, swparams,
++                                                  pcm_alsa_start_threshold(buffer_size, period_size, current_alsa_device));
+     if (err < 0)
+     {
+         logf("Unable to set start threshold mode for playback: %s", snd_strerror(err));
+@@ -416,6 +492,9 @@ static void async_callback(snd_async_handler_t *ahandler)
+         goto abort;
+     }
+ 
++    if (state == SND_PCM_STATE_OPEN || !pcm_alsa_params_ready(period_size, buffer_size, frames))
++        goto abort;
++
+ #ifdef HAVE_RECORDING
+     if (current_alsa_mode == SND_PCM_STREAM_PLAYBACK)
+     {
+@@ -502,6 +581,7 @@ static void close_hwdev(void)
+     logf("closedev (%p)", handle);
+ 
+     if (handle) {
++        pcm_alsa_device_closing(handle, current_alsa_device);
+         snd_pcm_drain(handle);
+ #ifdef AUDIOHW_MUTE_ON_STOP
+         audiohw_mute(true);
+@@ -534,11 +614,13 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+ 
+     logf("opendev %s (%p)", device, handle);
+ 
+-    if (handle && device == current_alsa_device
++    if (handle && pcm_alsa_keep_device(handle, device, current_alsa_device, mode,
+ #ifdef HAVE_RECORDING
+-        && current_alsa_mode == mode
++                                        current_alsa_mode
++#else
++                                        0
+ #endif
+-        )
++        ))
+     {
+         return;
+     }
+@@ -550,6 +632,7 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+     {
+         panicf("%s(): Cannot open device %s: %s", __func__, device, snd_strerror(err));
+     }
++    pcm_alsa_device_opened(handle, device, mode, &pcm_mtx);
+     last_sample_rate = 0;
+ 
+     pthread_mutexattr_t attr;
+-- 
+2.50.1 (Apple Git-155)
+
