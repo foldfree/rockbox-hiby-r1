@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -54,6 +55,29 @@ void hiby_pcm_set_bt_mac(const char *mac);
 #define BT_DEVICE_PICK_SCAN (-2)
 #define BT_SCAN_MENU_LABEL "Scan for new devices"
 
+/* Preferred A2DP codec. "Auto" negotiates the best codec the connected
+ * sink advertises; the rest force a specific codec (falling back to SBC,
+ * which is mandatory for A2DP, when the sink does not support it). */
+enum bt_codec_pref
+{
+    BT_CODEC_AUTO = 0,
+    BT_CODEC_SBC,
+    BT_CODEC_AAC,
+    BT_CODEC_APTX,
+    BT_CODEC_APTX_HD,
+    BT_CODEC_LDAC,
+    BT_CODEC_COUNT
+};
+
+static const char *const bt_codec_pref_names[BT_CODEC_COUNT] = {
+    "Auto (best available)",
+    "SBC",
+    "AAC",
+    "aptX",
+    "aptX-HD",
+    "LDAC",
+};
+
 struct bt_device
 {
     char mac[18];
@@ -72,9 +96,11 @@ static char bt_selected_mac[18];
 static const char *bt_playback_dev = BT_LOCAL_PLAYBACK_DEVICE;
 static char bt_bt_playback_dev[2][96];
 static unsigned int bt_bt_playback_dev_next = 0;
+static int bt_codec_pref = BT_CODEC_AUTO;
+static bool bt_codec_pref_loaded = false;
 
 static bool bt_wait_for_bluealsa_pcm(const char *mac, int timeout_ticks);
-static void bt_force_sbc_codec(const char *mac);
+static void bt_apply_preferred_codec(const char *mac);
 static bool bt_bluealsa_pcm_ready(const char *mac);
 static bool bt_is_connected(const char *mac);
 static bool bt_prepare_stack(void);
@@ -207,6 +233,270 @@ static void bt_mac_to_underscore(const char *mac, char *out, size_t out_len)
         out[n++] = (mac[i] == ':') ? '_' : mac[i];
     }
     out[n] = '\0';
+}
+
+/* Resolve a writable directory for persistent BT state (codec choice,
+ * debug log). Prefers the SD .rockbox directory where the rest of the
+ * Rockbox config lives, falling back to the persistent data partition. */
+static const char *bt_state_dir(void)
+{
+    static char dir[128];
+    static bool resolved = false;
+    static const char *const candidates[] = {
+        "/usr/data/mnt/sd_0/.rockbox",
+        "/mnt/sd_0/.rockbox",
+        "/data",
+        NULL,
+    };
+
+    if (!resolved)
+    {
+        struct stat st;
+        int i;
+
+        dir[0] = '\0';
+        for (i = 0; candidates[i]; i++)
+        {
+            if (stat(candidates[i], &st) == 0 && S_ISDIR(st.st_mode))
+            {
+                snprintf(dir, sizeof(dir), "%s", candidates[i]);
+                break;
+            }
+        }
+        if (!dir[0])
+            snprintf(dir, sizeof(dir), "/data");
+        resolved = true;
+    }
+
+    return dir;
+}
+
+static void bt_dbg(const char *fmt, ...)
+{
+    char path[160];
+    FILE *fp;
+    va_list ap;
+
+    snprintf(path, sizeof(path), "%s/bt_debug.log", bt_state_dir());
+    fp = fopen(path, "a");
+    if (!fp)
+        return;
+
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+    fclose(fp);
+}
+
+static int bt_load_codec_pref(void)
+{
+    char path[160];
+    FILE *fp;
+    int value = BT_CODEC_AUTO;
+
+    snprintf(path, sizeof(path), "%s/bt_codec.txt", bt_state_dir());
+    fp = fopen(path, "r");
+    if (fp)
+    {
+        if (fscanf(fp, "%d", &value) != 1)
+            value = BT_CODEC_AUTO;
+        fclose(fp);
+    }
+
+    if (value < 0 || value >= BT_CODEC_COUNT)
+        value = BT_CODEC_AUTO;
+    return value;
+}
+
+static void bt_save_codec_pref(int pref)
+{
+    char path[160];
+    FILE *fp;
+
+    snprintf(path, sizeof(path), "%s/bt_codec.txt", bt_state_dir());
+    fp = fopen(path, "w");
+    if (!fp)
+        return;
+    fprintf(fp, "%d\n", pref);
+    fclose(fp);
+}
+
+static bool bt_is_codec_word_char(char c)
+{
+    return isalnum((unsigned char)c) || c == '-';
+}
+
+/* Whole-word, case-insensitive codec lookup so that "aptX" does not
+ * spuriously match inside "aptX-HD" ('-' counts as part of a word). */
+static bool bt_output_has_codec(const char *text, const char *token)
+{
+    size_t tlen = strlen(token);
+    const char *p = text;
+
+    while (*p)
+    {
+        if (bt_is_codec_word_char(*p))
+        {
+            const char *start = p;
+            size_t len;
+
+            while (bt_is_codec_word_char(*p))
+                p++;
+
+            len = (size_t)(p - start);
+            if (len == tlen && strncasecmp(start, token, tlen) == 0)
+                return true;
+        }
+        else
+        {
+            p++;
+        }
+    }
+
+    return false;
+}
+
+/* Read the codec bluealsa has actually negotiated for the sink, e.g.
+ * from a "Selected codec: SBC" line. Returns false if unavailable. */
+static bool bt_read_active_codec(const char *mac, char *out, size_t out_len)
+{
+    char mac_u[18];
+    char pcm_path[96];
+    char cmd[256];
+    char line[256];
+    FILE *fp;
+    bool found = false;
+
+    if (!mac || !*mac || !out || out_len == 0)
+        return false;
+
+    bt_mac_to_underscore(mac, mac_u, sizeof(mac_u));
+    snprintf(pcm_path, sizeof(pcm_path),
+             "/org/bluealsa/hci0/dev_%s/a2dpsrc/sink", mac_u);
+    snprintf(cmd, sizeof(cmd),
+             "bluealsa-cli codec '%s' 2>/dev/null", pcm_path);
+
+    fp = popen(cmd, "r");
+    if (!fp)
+        return false;
+
+    while (fgets(line, sizeof(line), fp))
+    {
+        char *colon;
+
+        if (!strstr(line, "elected"))   /* "Selected codec:" */
+            continue;
+
+        colon = strchr(line, ':');
+        if (!colon)
+            continue;
+
+        colon++;
+        while (*colon == ' ' || *colon == '\t')
+            colon++;
+
+        {
+            char *end = colon;
+            while (*end && bt_is_codec_word_char(*end))
+                end++;
+            *end = '\0';
+        }
+
+        if (*colon)
+        {
+            snprintf(out, out_len, "%s", colon);
+            found = true;
+        }
+        break;
+    }
+
+    pclose(fp);
+    return found;
+}
+
+/* Select the playback codec for the connected sink according to the
+ * user's preference. Replaces the previous unconditional SBC force. */
+static void bt_apply_preferred_codec(const char *mac)
+{
+    static const char *const codec_tokens[BT_CODEC_COUNT] = {
+        NULL, "SBC", "AAC", "aptX", "aptX-HD", "LDAC"
+    };
+    /* Best-to-worst order used when the preference is "Auto". */
+    static const int auto_order[] = {
+        BT_CODEC_LDAC, BT_CODEC_APTX_HD, BT_CODEC_APTX,
+        BT_CODEC_AAC, BT_CODEC_SBC
+    };
+
+    char mac_u[18];
+    char pcm_path[96];
+    char cmd[256];
+    char avail[512];
+    const char *chosen = NULL;
+    FILE *fp;
+
+    if (!mac || !*mac)
+        return;
+
+    bt_mac_to_underscore(mac, mac_u, sizeof(mac_u));
+    snprintf(pcm_path, sizeof(pcm_path),
+             "/org/bluealsa/hci0/dev_%s/a2dpsrc/sink", mac_u);
+
+    /* Ask bluealsa which codecs this sink actually advertises. */
+    avail[0] = '\0';
+    snprintf(cmd, sizeof(cmd),
+             "bluealsa-cli codec '%s' 2>/dev/null", pcm_path);
+    fp = popen(cmd, "r");
+    if (fp)
+    {
+        char line[256];
+        size_t used = 0;
+
+        while (fgets(line, sizeof(line), fp))
+        {
+            size_t l = strlen(line);
+            if (used + l < sizeof(avail))
+            {
+                memcpy(avail + used, line, l);
+                used += l;
+                avail[used] = '\0';
+            }
+        }
+        pclose(fp);
+    }
+
+    if (bt_codec_pref == BT_CODEC_AUTO)
+    {
+        size_t i;
+        for (i = 0; i < sizeof(auto_order) / sizeof(auto_order[0]); i++)
+        {
+            const char *tok = codec_tokens[auto_order[i]];
+            if (tok && bt_output_has_codec(avail, tok))
+            {
+                chosen = tok;
+                break;
+            }
+        }
+    }
+    else
+    {
+        const char *tok = codec_tokens[bt_codec_pref];
+        /* Honour the request if the sink advertises it, or if we could
+         * not read the list at all (let bluealsa decide/validate). */
+        if (tok && (avail[0] == '\0' || bt_output_has_codec(avail, tok)))
+            chosen = tok;
+    }
+
+    if (!chosen)
+        chosen = "SBC"; /* mandatory A2DP codec: always a safe fallback */
+
+    snprintf(cmd, sizeof(cmd),
+             "bluealsa-cli codec '%s' %s >/tmp/rb_bt_codec.log 2>&1",
+             pcm_path, chosen);
+    system(cmd);
+
+    bt_dbg("codec: pref=%d available=[%s] chosen=%s",
+           bt_codec_pref, avail[0] ? avail : "?", chosen);
 }
 
 static int bt_add_device_unique_ex(struct bt_device *devices, int count, int max_devices,
@@ -657,7 +947,7 @@ static void bt_route_to_local(bool show_message)
 
 static bool bt_route_to_bluetooth(const char *mac)
 {
-    int rc;
+    int attempt;
 
     if (!mac || !mac[0])
         return false;
@@ -666,23 +956,40 @@ static bool bt_route_to_bluetooth(const char *mac)
 
     if (!bt_wait_for_bluealsa_pcm(mac, HZ * 6))
     {
+        bt_dbg("route: no PCM for %s within 6s", mac);
         bt_route_to_local(false);
         return false;
     }
 
-    bt_force_sbc_codec(mac);
+    bt_apply_preferred_codec(mac);
+
+    /* Selecting a codec makes bluealsa re-acquire the transport, so wait
+     * for the PCM to come back before opening the ALSA device. */
     if (!bt_wait_for_bluealsa_pcm(mac, HZ * 3))
     {
+        bt_dbg("route: PCM gone after codec select for %s", mac);
         bt_route_to_local(false);
         return false;
     }
 
-    rc = pcm_alsa_switch_playback_device(bt_playback_dev);
-    if (rc == 0)
+    /* Opening the bluealsa ALSA device can transiently fail right after
+     * the transport is re-acquired. Retry a few times with backoff, and
+     * give up early only if the transport itself has disappeared. */
+    for (attempt = 1; attempt <= 3; attempt++)
     {
-        hiby_pcm_set_bt_mac(mac);
-        bt_kick_audio_if_playing();
-        return true;
+        if (pcm_alsa_switch_playback_device(bt_playback_dev) == 0)
+        {
+            hiby_pcm_set_bt_mac(mac);
+            bt_kick_audio_if_playing();
+            bt_dbg("route: ok for %s (attempt %d)", mac, attempt);
+            return true;
+        }
+
+        bt_dbg("route: device switch failed for %s (attempt %d)", mac, attempt);
+        sleep(HZ / 3);
+
+        if (!bt_wait_for_bluealsa_pcm(mac, HZ * 2))
+            break;
     }
 
     bt_route_to_local(false);
@@ -777,27 +1084,18 @@ static bool bt_wait_for_bluealsa_pcm(const char *mac, int timeout_ticks)
     return false;
 }
 
-static void bt_force_sbc_codec(const char *mac)
-{
-    char mac_u[18];
-    char pcm_path[96];
-    char cmd[256];
-
-    if (!mac || !*mac)
-        return;
-
-    bt_mac_to_underscore(mac, mac_u, sizeof(mac_u));
-    snprintf(pcm_path, sizeof(pcm_path),
-             "/org/bluealsa/hci0/dev_%s/a2dpsrc/sink", mac_u);
-    snprintf(cmd, sizeof(cmd),
-             "bluealsa-cli codec '%s' SBC >/tmp/rb_bt_codec.log 2>&1", pcm_path);
-    system(cmd);
-}
-
 static bool bt_prepare_stack(void)
 {
     char reply[BT_SYS_REPLY_MAX];
     int i;
+
+    /* If the control socket already answers, the stack is up; skip the
+     * heavyweight bt_enable which tears down and re-initialises the whole
+     * stack (a frequent source of the connect-retry storms). */
+    reply[0] = '\0';
+    if (bt_sys_command("BT:LIST", reply, sizeof(reply)) == 0 &&
+        bt_sys_reply_ok(reply, "BT:LIST"))
+        return true;
 
     system("/usr/bin/bt_enable >/tmp/rb_bt_enable.log 2>&1");
 
@@ -950,12 +1248,16 @@ static void bt_show_status(void)
 
     if (bt_get_active_mac(active_mac, sizeof(active_mac)))
     {
+        char codec[24];
+
         simplelist_addline("Device: Bluetooth");
         simplelist_addline("MAC: %s", active_mac);
         simplelist_addline("Connected: %s",
                            bt_is_connected(active_mac) ? "Yes" : "No");
         simplelist_addline("A2DP PCM: %s",
                            bt_bluealsa_pcm_ready(active_mac) ? "Ready" : "Not ready");
+        if (bt_read_active_codec(active_mac, codec, sizeof(codec)))
+            simplelist_addline("Codec: %s", codec);
     }
     else if (bt_selected_mac[0])
     {
@@ -974,16 +1276,71 @@ static void bt_show_status(void)
     simplelist_show_list(&info);
 }
 
+static const char *bt_codec_name_cb(int selected_item, void *data,
+    char *buffer, size_t buffer_len)
+{
+    (void)data;
+
+    if (selected_item < 0 || selected_item >= BT_CODEC_COUNT)
+    {
+        buffer[0] = '\0';
+        return buffer;
+    }
+
+    snprintf(buffer, buffer_len, "%s%s", bt_codec_pref_names[selected_item],
+             selected_item == bt_codec_pref ? "  [current]" : "");
+    return buffer;
+}
+
+static void bt_show_codec_menu(void)
+{
+    struct simplelist_info info;
+
+    simplelist_info_init(&info, "Preferred codec", BT_CODEC_COUNT, NULL);
+    info.get_name = bt_codec_name_cb;
+    info.action_callback = bt_simplelist_ok_cancel;
+    info.selection = bt_codec_pref;
+    info.title_icon = Icon_Submenu;
+
+    simplelist_show_list(&info);
+    if (info.selection >= 0 && info.selection < BT_CODEC_COUNT)
+    {
+        char mac[18];
+
+        bt_codec_pref = info.selection;
+        bt_codec_pref_loaded = true;
+        bt_save_codec_pref(bt_codec_pref);
+
+        /* Apply live if a Bluetooth sink is currently routed. */
+        if (bt_get_active_mac(mac, sizeof(mac)))
+        {
+            bt_apply_preferred_codec(mac);
+            splash(HZ, "Codec applied");
+        }
+        else
+        {
+            splash(HZ, "Codec saved");
+        }
+    }
+}
+
 int hiby_bluetooth_menu(void)
 {
     static const char *const action_items[] =
     {
         "Status",
         "Devices",
+        "Codec",
         "Disconnect",
     };
 
     int action = -1;
+
+    if (!bt_codec_pref_loaded)
+    {
+        bt_codec_pref = bt_load_codec_pref();
+        bt_codec_pref_loaded = true;
+    }
 
     while (true)
     {
@@ -1011,6 +1368,9 @@ int hiby_bluetooth_menu(void)
                 bt_show_devices();
                 break;
             case 2:
+                bt_show_codec_menu();
+                break;
+            case 3:
                 bt_disconnect();
                 break;
             default:
