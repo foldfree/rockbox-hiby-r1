@@ -1,4 +1,4 @@
-From 5696e975f04ed8b8462a42245dab9d06327b26e9 Mon Sep 17 00:00:00 2001
+From 974cebe7f2e2a2af29ef0e73f391e4b029e5b1ec Mon Sep 17 00:00:00 2001
 From: test <test@example.invalid>
 Date: Sun, 31 May 2026 20:24:50 +0100
 Subject: [PATCH 3/5] hibyr1: add platform PCM hooks and HiBy weak overrides
@@ -29,8 +29,8 @@ mutex and delegates. Without this definition the HiBy build failed to
 link (undefined reference to pcm_alsa_pump_locked).
 ---
  firmware/SOURCES                  |   3 +
- firmware/target/hosted/pcm-alsa.c | 164 ++++++++++++++++++++++++++----
- 2 files changed, 146 insertions(+), 21 deletions(-)
+ firmware/target/hosted/pcm-alsa.c | 177 ++++++++++++++++++++++++++----
+ 2 files changed, 159 insertions(+), 21 deletions(-)
 
 diff --git a/firmware/SOURCES b/firmware/SOURCES
 index 20158f8489..262369dc0b 100644
@@ -47,7 +47,7 @@ index 20158f8489..262369dc0b 100644
  #endif
  
 diff --git a/firmware/target/hosted/pcm-alsa.c b/firmware/target/hosted/pcm-alsa.c
-index 7e4833fdfe..ece1be6bb1 100644
+index 7e4833fdfe..f6858b4280 100644
 --- a/firmware/target/hosted/pcm-alsa.c
 +++ b/firmware/target/hosted/pcm-alsa.c
 @@ -111,6 +111,87 @@ static snd_pcm_stream_t current_alsa_mode;  /* SND_PCM_STREAM_PLAYBACK / _CAPTUR
@@ -185,7 +185,7 @@ index 7e4833fdfe..ece1be6bb1 100644
  
      if (state == SND_PCM_STATE_XRUN)
      {
-@@ -403,19 +485,22 @@ static void async_callback(snd_async_handler_t *ahandler)
+@@ -403,18 +485,28 @@ static void async_callback(snd_async_handler_t *ahandler)
          err = snd_pcm_recover(handle, -EPIPE, 0);
          if (err < 0) {
              logf("XRUN Recovery error: %s", snd_strerror(err));
@@ -204,14 +204,20 @@ index 7e4833fdfe..ece1be6bb1 100644
 -        goto abort;
 +        return;
      }
- 
++    else if (state == SND_PCM_STATE_DISCONNECTED)
++    {
++        /* Hot-pluggable sink (e.g. Bluetooth) went away mid-stream. Do
++         * not touch the dead handle; the route layer will switch us back
++         * to local output. */
++        return;
++    }
++
 +    if (state == SND_PCM_STATE_OPEN || !pcm_alsa_params_ready(period_size, buffer_size, frames))
 +        return;
-+
+ 
  #ifdef HAVE_RECORDING
      if (current_alsa_mode == SND_PCM_STREAM_PLAYBACK)
-     {
-@@ -433,7 +518,7 @@ static void async_callback(snd_async_handler_t *ahandler)
+@@ -433,7 +525,7 @@ static void async_callback(snd_async_handler_t *ahandler)
                      err = snd_pcm_recover(handle, -EPIPE, 0);
                      if (err < 0) {
                         logf("XRUN Recovery error: %s", snd_strerror(err));
@@ -220,7 +226,7 @@ index 7e4833fdfe..ece1be6bb1 100644
                      }
                      goto retry;
                  }
-@@ -463,7 +548,7 @@ static void async_callback(snd_async_handler_t *ahandler)
+@@ -463,7 +555,7 @@ static void async_callback(snd_async_handler_t *ahandler)
                  err = snd_pcm_recover(handle, -EPIPE, 0);
                  if (err < 0) {
                     logf("XRUN Recovery error: %s", snd_strerror(err));
@@ -229,7 +235,7 @@ index 7e4833fdfe..ece1be6bb1 100644
                  }
  		continue;  /* buffer contents trashed, no sense in trying to copy */
              }
-@@ -492,8 +577,24 @@ static void async_callback(snd_async_handler_t *ahandler)
+@@ -492,8 +584,24 @@ static void async_callback(snd_async_handler_t *ahandler)
              /* Depending on the error we might be SOL */
          }
      }
@@ -255,7 +261,7 @@ index 7e4833fdfe..ece1be6bb1 100644
      pthread_mutex_unlock(&pcm_mtx);
  }
  
-@@ -502,6 +603,7 @@ static void close_hwdev(void)
+@@ -502,6 +610,7 @@ static void close_hwdev(void)
      logf("closedev (%p)", handle);
  
      if (handle) {
@@ -263,7 +269,7 @@ index 7e4833fdfe..ece1be6bb1 100644
          snd_pcm_drain(handle);
  #ifdef AUDIOHW_MUTE_ON_STOP
          audiohw_mute(true);
-@@ -534,11 +636,13 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+@@ -534,11 +643,13 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
  
      logf("opendev %s (%p)", device, handle);
  
@@ -280,7 +286,7 @@ index 7e4833fdfe..ece1be6bb1 100644
      {
          return;
      }
-@@ -546,10 +650,28 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+@@ -546,9 +657,26 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
      /* Close old handle */
      close_hwdev();
  
@@ -307,10 +313,22 @@ index 7e4833fdfe..ece1be6bb1 100644
 +        if (mode == SND_PCM_STREAM_PLAYBACK)
 +            playback_dev = fallback;
      }
-+    pcm_alsa_device_opened(handle, device, mode, &pcm_mtx);
      last_sample_rate = 0;
  
-     pthread_mutexattr_t attr;
+@@ -593,6 +721,13 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+ #endif
+     current_alsa_device = device;
+ 
++    /* Start the platform pump LAST: pcm_mtx, the signal stack and the
++     * async handler must all be fully initialised before the HiBy poll
++     * thread (which locks pcm_mtx and pumps the handle) can run. Starting
++     * it earlier raced a half-initialised mutex/device on every route
++     * switch and segfaulted. */
++    pcm_alsa_device_opened(handle, device, mode, &pcm_mtx);
++
+     atexit(alsadev_cleanup);
+ }
+ 
 -- 
 2.50.1 (Apple Git-155)
 
