@@ -1219,6 +1219,28 @@ static bool bt_prepare_stack(void)
     return false;
 }
 
+/* Connect via bluetoothctl. The HiBy sys_server "BT:CONNECT" establishes
+ * a link but does not reliably bring up the A2DP source profile, so the
+ * BlueALSA sink PCM never appears ("connected, no route to audio"). A
+ * plain `bluetoothctl connect` does bring A2DP up (it is also what HiBy's
+ * own bt_connect_last.sh uses), so use it as the connect mechanism. */
+static bool bt_connect_via_bluetoothctl(const char *mac)
+{
+    char cmd[160];
+
+    if (!mac || !*mac)
+        return false;
+
+    /* power on + connect; ignore output, we verify via the PCM below */
+    snprintf(cmd, sizeof(cmd),
+             "printf 'power on\\nconnect %s\\nquit\\n' | bluetoothctl "
+             ">/tmp/rb_bt_connect.log 2>&1", mac);
+    system(cmd);
+
+    /* A2DP transport/PCM acquisition is asynchronous; wait for the sink. */
+    return bt_wait_for_bluealsa_pcm(mac, HZ * 8);
+}
+
 static void bt_show_devices(void)
 {
     struct bt_device devices[BT_MAX_DEVICES];
@@ -1306,13 +1328,12 @@ static void bt_connect_device(const struct bt_device *device)
     routed = bt_route_to_bluetooth(mac);
     if (!routed)
     {
-        snprintf(cmd, sizeof(cmd), "BT:CONNECT:%s", mac);
-        ctl_rc = bt_sys_command(cmd, reply, sizeof(reply));
-        if (ctl_rc == 0 && bt_sys_reply_ok(reply, "BT:CONNECT"))
-        {
-            sleep(HZ / 2);
+        /* sys_server BT:CONNECT linked the device but A2DP did not come
+         * up. Bring the audio profile up the reliable way and re-route. */
+        bt_dbg("connect: sys_server route failed, trying bluetoothctl for %s",
+               mac);
+        if (bt_connect_via_bluetoothctl(mac))
             routed = bt_route_to_bluetooth(mac);
-        }
     }
 
     if (routed)
