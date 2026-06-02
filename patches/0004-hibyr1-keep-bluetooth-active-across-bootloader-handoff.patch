@@ -1,17 +1,45 @@
-From fdc3da9289c5924246fbeb024c555549aaea1f49 Mon Sep 17 00:00:00 2001
+From 16bb710cb5227c35d170e4ebba0d9a8ed032b103 Mon Sep 17 00:00:00 2001
 From: rockbox-hiby-r1-ci <ci@example.invalid>
 Date: Sun, 8 Mar 2026 19:15:00 +0000
-Subject: [PATCH 5/5] hibyr1: keep bluetooth active across bootloader handoff
+Subject: [PATCH 5/5] hibyr1: keep bluetooth active across handoff; enable
+ bootloader logging
 
+Two bootloader (hibyos_linux.c) changes for the R1:
+
+1. Drop HIBY_R1 from the bt_suspend-on-boot guard so Bluetooth stays
+   active across the bootloader -> Rockbox handoff (BT IS supported here).
+
+2. Enable ENABLE_LOGGING. The bootloader then redirects its stdout/stderr
+   to BASE_DIR/rockbox.log, and the BOOT_ROCKBOX path execve()s the
+   Rockbox binary WITHOUT closing those fds, so Rockbox inherits them.
+   rb_backtrace prints crash backtraces to stdout, so a segfault is now
+   captured to /data/mnt/sd_0/rockbox.log for post-mortem instead of only
+   flashing on /dev/console. Pairs with shipping the unstripped
+   rockbox.elf for addr2line symbolication.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
- bootloader/hibyos_linux.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
+ bootloader/hibyos_linux.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
 
 diff --git a/bootloader/hibyos_linux.c b/bootloader/hibyos_linux.c
-index edda204796..4ad5b87d94 100644
+index edda204796..ce43bb1e3f 100644
 --- a/bootloader/hibyos_linux.c
 +++ b/bootloader/hibyos_linux.c
-@@ -694,8 +694,8 @@ int main(int argc, char **argv)
+@@ -47,7 +47,11 @@
+ #include <stdarg.h>
+ #include "version.h"
+ 
+-//#define ENABLE_LOGGING
++/* Enabled on the R1 so the bootloader redirects stdout/stderr to
++ * BASE_DIR/rockbox.log. The Rockbox binary is exec'd with these fds
++ * inherited, so its crash backtrace (rb_backtrace prints to stdout) is
++ * captured to a file for post-mortem instead of only hitting /dev/console. */
++#define ENABLE_LOGGING
+ //#define AUTO_ENABLE_ADB
+ 
+ /* Basic configuration */
+@@ -694,8 +698,8 @@ int main(int argc, char **argv)
          }
          else if(mode == BOOT_ROCKBOX)
          {
