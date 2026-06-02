@@ -1,4 +1,4 @@
-From d4cb10a1027d1a83da39f62158218e11b126b910 Mon Sep 17 00:00:00 2001
+From c0d8efa8215f6eb094599da60245d08552ab8973 Mon Sep 17 00:00:00 2001
 From: test <test@example.invalid>
 Date: Sun, 31 May 2026 20:24:50 +0100
 Subject: [PATCH 3/5] hibyr1: add platform PCM hooks and HiBy weak overrides
@@ -29,8 +29,8 @@ mutex and delegates. Without this definition the HiBy build failed to
 link (undefined reference to pcm_alsa_pump_locked).
 ---
  firmware/SOURCES                  |   3 +
- firmware/target/hosted/pcm-alsa.c | 217 +++++++++++++++++++++++++++---
- 2 files changed, 198 insertions(+), 22 deletions(-)
+ firmware/target/hosted/pcm-alsa.c | 223 +++++++++++++++++++++++++++---
+ 2 files changed, 204 insertions(+), 22 deletions(-)
 
 diff --git a/firmware/SOURCES b/firmware/SOURCES
 index 20158f8489..262369dc0b 100644
@@ -47,7 +47,7 @@ index 20158f8489..262369dc0b 100644
  #endif
  
 diff --git a/firmware/target/hosted/pcm-alsa.c b/firmware/target/hosted/pcm-alsa.c
-index 7e4833fdfe..bb0ab801ba 100644
+index 7e4833fdfe..65c9ea2149 100644
 --- a/firmware/target/hosted/pcm-alsa.c
 +++ b/firmware/target/hosted/pcm-alsa.c
 @@ -57,6 +57,17 @@
@@ -315,11 +315,13 @@ index 7e4833fdfe..bb0ab801ba 100644
      {
          return;
      }
-@@ -546,9 +678,26 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+@@ -546,9 +678,32 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
      /* Close old handle */
      close_hwdev();
  
 -    if ((err = snd_pcm_open(&handle, device, mode, 0)) < 0)
++    RBTRACE("open_hwdev TRY dev=%s mode=%d", device ? device : "(null)", (int)mode);
++
 +    /* Open the device. A hot-pluggable sink (e.g. a Bluetooth A2DP route)
 +     * can disappear between routing and open, so on failure ask the
 +     * platform for a fallback device and retry. pcm_alsa_open_fallback()
@@ -334,17 +336,21 @@ index 7e4833fdfe..bb0ab801ba 100644
 +            panicf("%s(): Cannot open device %s: %s",
 +                   __func__, device, snd_strerror(err));
 +
++        RBTRACE("open %s failed (%s); falling back to %s",
++                device, snd_strerror(err), fallback);
 +        logf("open %s failed (%s); falling back to %s",
 +             device, snd_strerror(err), fallback);
 +        device = fallback;
-+        /* Persist the fallback for the playback path so the next reopen
-+         * does not retry the dead device. Capture uses its own target. */
-+        if (mode == SND_PCM_STREAM_PLAYBACK)
-+            playback_dev = fallback;
++        /* NOTE: deliberately do NOT overwrite the global playback_dev here.
++         * This fallback only prevents a panic for THIS open; the configured
++         * route (e.g. a Bluetooth sink that is briefly not openable while
++         * its transport settles) must remain the target so the next
++         * pcm_play_dma_start retries it instead of being silently and
++         * permanently dropped to the local DAC. */
      }
      last_sample_rate = 0;
  
-@@ -593,6 +742,15 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+@@ -593,6 +748,15 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
  #endif
      current_alsa_device = device;
  
@@ -360,7 +366,7 @@ index 7e4833fdfe..bb0ab801ba 100644
      atexit(alsadev_cleanup);
  }
  
-@@ -666,6 +824,9 @@ static void sink_dma_stop(void)
+@@ -666,6 +830,9 @@ static void sink_dma_stop(void)
  static void sink_dma_start(const void *addr, size_t size)
  {
      logf("PCM DMA start (%p %d)", addr, size);
@@ -370,7 +376,7 @@ index 7e4833fdfe..bb0ab801ba 100644
  
      pcm_data = addr;
      pcm_size = size;
-@@ -678,6 +839,8 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -678,6 +845,8 @@ static void sink_dma_start(const void *addr, size_t size)
      {
          snd_pcm_state_t state = snd_pcm_state(handle);
          logf("PCM State %d", state);
@@ -379,7 +385,7 @@ index 7e4833fdfe..bb0ab801ba 100644
  
          switch (state)
          {
-@@ -696,7 +859,9 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -696,7 +865,9 @@ static void sink_dma_start(const void *addr, size_t size)
              }
              case SND_PCM_STATE_SETUP:
              {
@@ -389,7 +395,7 @@ index 7e4833fdfe..bb0ab801ba 100644
                  if (err < 0)
                      logf("Prepare error: %s", snd_strerror(err));
              }
-@@ -720,11 +885,16 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -720,11 +891,16 @@ static void sink_dma_start(const void *addr, size_t size)
                  }
  #else
                  /* Fill buffer with proper sample data */
@@ -407,7 +413,7 @@ index 7e4833fdfe..bb0ab801ba 100644
                          if (err < 0 && err != period_size && err != -EAGAIN)
                          {
                              logf("Write error: written %i expected %li", err, period_size);
-@@ -732,8 +902,11 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -732,8 +908,11 @@ static void sink_dma_start(const void *addr, size_t size)
                          }
                      }
                  }
