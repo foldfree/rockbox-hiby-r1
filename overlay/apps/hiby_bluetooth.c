@@ -106,7 +106,7 @@ static int bt_codec_pref = BT_CODEC_AUTO;
 static bool bt_codec_pref_loaded = false;
 
 static bool bt_wait_for_bluealsa_pcm(const char *mac, int timeout_ticks);
-static void bt_apply_preferred_codec(const char *mac);
+static bool bt_apply_preferred_codec(const char *mac);
 static bool bt_bluealsa_pcm_ready(const char *mac);
 static bool bt_is_connected(const char *mac);
 static bool bt_prepare_stack(void);
@@ -422,8 +422,10 @@ static bool bt_read_active_codec(const char *mac, char *out, size_t out_len)
 }
 
 /* Select the playback codec for the connected sink according to the
- * user's preference. Replaces the previous unconditional SBC force. */
-static void bt_apply_preferred_codec(const char *mac)
+ * user's preference. Replaces the previous unconditional SBC force.
+ * Returns true if the codec was actually changed (which tears down and
+ * re-acquires the A2DP transport), false if no change was made. */
+static bool bt_apply_preferred_codec(const char *mac)
 {
     static const char *const codec_tokens[BT_CODEC_COUNT] = {
         NULL, "SBC", "AAC", "aptX", "aptX-HD", "LDAC"
@@ -451,7 +453,7 @@ static void bt_apply_preferred_codec(const char *mac)
     FILE *fp;
 
     if (!mac || !*mac)
-        return;
+        return false;
 
     bt_mac_to_underscore(mac, mac_u, sizeof(mac_u));
     snprintf(pcm_path, sizeof(pcm_path),
@@ -505,13 +507,48 @@ static void bt_apply_preferred_codec(const char *mac)
     if (!chosen)
         chosen = "SBC"; /* mandatory A2DP codec: always a safe fallback */
 
+    /* If the sink is already on the codec we want, do NOT issue
+     * "bluealsa-cli codec" again: changing the codec tears down and
+     * re-acquires the A2DP transport (the PCM disappears for a moment),
+     * which races our route setup and was causing "PCM gone after codec
+     * select" / "no route to audio". Parse the current "Selected codec:"
+     * from the query output and skip the switch when it already matches. */
+    {
+        const char *sel = strstr(avail, "elected codec:"); /* "Selected codec:" */
+        if (sel)
+        {
+            char cur[24];
+            const char *p = strchr(sel, ':');
+            int n = 0;
+            if (p)
+            {
+                p++;
+                while (*p == ' ' || *p == '\t')
+                    p++;
+                while (p[n] && bt_is_codec_word_char(p[n]) && n < (int)sizeof(cur) - 1)
+                {
+                    cur[n] = p[n];
+                    n++;
+                }
+                cur[n] = '\0';
+                if (n > 0 && strcasecmp(cur, chosen) == 0)
+                {
+                    bt_dbg("codec: already %s, skipping switch (pref=%d)",
+                           cur, bt_codec_pref);
+                    return false;
+                }
+            }
+        }
+    }
+
     snprintf(cmd, sizeof(cmd),
              "bluealsa-cli codec '%s' %s >/tmp/rb_bt_codec.log 2>&1",
              pcm_path, chosen);
     system(cmd);
 
-    bt_dbg("codec: pref=%d available=[%s] chosen=%s",
+    bt_dbg("codec: pref=%d available=[%s] chosen=%s (switched)",
            bt_codec_pref, avail[0] ? avail : "?", chosen);
+    return true;
 }
 
 static int bt_add_device_unique_ex(struct bt_device *devices, int count, int max_devices,
@@ -976,15 +1013,26 @@ static bool bt_route_to_bluetooth(const char *mac)
         return false;
     }
 
-    bt_apply_preferred_codec(mac);
-
-    /* Selecting a codec makes bluealsa re-acquire the transport, so wait
-     * for the PCM to come back before opening the ALSA device. */
-    if (!bt_wait_for_bluealsa_pcm(mac, HZ * 3))
+    /* bt_apply_preferred_codec() returns true if it actually changed the
+     * codec (which tears down + re-acquires the A2DP transport), false if
+     * the sink was already on the wanted codec (no teardown). */
+    if (bt_apply_preferred_codec(mac))
     {
-        bt_dbg("route: PCM gone after codec select for %s", mac);
-        bt_route_to_local(false);
-        return false;
+        /* The codec switch makes the PCM briefly disappear and reappear.
+         * Do NOT trust an immediate "PCM present" check: the OLD transport
+         * may still be listed for a moment before teardown, so we would
+         * race onto a dying PCM. Give bluealsa time to drop the old
+         * transport first, then wait for the new one to settle. */
+        sleep(HZ);
+        if (!bt_wait_for_bluealsa_pcm(mac, HZ * 6))
+        {
+            bt_dbg("route: PCM gone after codec select for %s", mac);
+            bt_route_to_local(false);
+            return false;
+        }
+        /* Small extra settle so the re-acquired transport is fully ready
+         * for snd_pcm_open (avoids the transient open failure downstream). */
+        sleep(HZ / 2);
     }
 
     /* Opening the bluealsa ALSA device can transiently fail right after
