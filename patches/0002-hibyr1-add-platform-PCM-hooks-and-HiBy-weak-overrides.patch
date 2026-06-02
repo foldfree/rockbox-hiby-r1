@@ -1,4 +1,4 @@
-From 60f6aeff8bd10d08cf9ea704d533d9a22435cb45 Mon Sep 17 00:00:00 2001
+From e1bcd9821e361899e2cd223f019d90543febe0af Mon Sep 17 00:00:00 2001
 From: test <test@example.invalid>
 Date: Sun, 31 May 2026 20:24:50 +0100
 Subject: [PATCH 3/5] hibyr1: add platform PCM hooks and HiBy weak overrides
@@ -29,8 +29,8 @@ mutex and delegates. Without this definition the HiBy build failed to
 link (undefined reference to pcm_alsa_pump_locked).
 ---
  firmware/SOURCES                  |   3 +
- firmware/target/hosted/pcm-alsa.c | 228 +++++++++++++++++++++++++++---
- 2 files changed, 209 insertions(+), 22 deletions(-)
+ firmware/target/hosted/pcm-alsa.c | 250 +++++++++++++++++++++++++++---
+ 2 files changed, 231 insertions(+), 22 deletions(-)
 
 diff --git a/firmware/SOURCES b/firmware/SOURCES
 index 20158f8489..262369dc0b 100644
@@ -47,7 +47,7 @@ index 20158f8489..262369dc0b 100644
  #endif
  
 diff --git a/firmware/target/hosted/pcm-alsa.c b/firmware/target/hosted/pcm-alsa.c
-index 7e4833fdfe..da017a397e 100644
+index 7e4833fdfe..83474135a4 100644
 --- a/firmware/target/hosted/pcm-alsa.c
 +++ b/firmware/target/hosted/pcm-alsa.c
 @@ -57,6 +57,17 @@
@@ -218,7 +218,7 @@ index 7e4833fdfe..da017a397e 100644
  
      if (state == SND_PCM_STATE_XRUN)
      {
-@@ -403,19 +509,29 @@ static void async_callback(snd_async_handler_t *ahandler)
+@@ -403,18 +509,28 @@ static void async_callback(snd_async_handler_t *ahandler)
          err = snd_pcm_recover(handle, -EPIPE, 0);
          if (err < 0) {
              logf("XRUN Recovery error: %s", snd_strerror(err));
@@ -236,21 +236,20 @@ index 7e4833fdfe..da017a397e 100644
      {
 -        goto abort;
 +        return;
-+    }
+     }
 +    else if (state == SND_PCM_STATE_DISCONNECTED)
 +    {
 +        /* Hot-pluggable sink (e.g. Bluetooth) went away mid-stream. Do
 +         * not touch the dead handle; the route layer will switch us back
 +         * to local output. */
 +        return;
-     }
- 
++    }
++
 +    if (state == SND_PCM_STATE_OPEN || !pcm_alsa_params_ready(period_size, buffer_size, frames))
 +        return;
-+
+ 
  #ifdef HAVE_RECORDING
      if (current_alsa_mode == SND_PCM_STREAM_PLAYBACK)
-     {
 @@ -433,7 +549,7 @@ static void async_callback(snd_async_handler_t *ahandler)
                      err = snd_pcm_recover(handle, -EPIPE, 0);
                      if (err < 0) {
@@ -379,7 +378,7 @@ index 7e4833fdfe..da017a397e 100644
  
      audiohw_preinit();
  
-@@ -666,6 +835,9 @@ static void sink_dma_stop(void)
+@@ -666,10 +835,35 @@ static void sink_dma_stop(void)
  static void sink_dma_start(const void *addr, size_t size)
  {
      logf("PCM DMA start (%p %d)", addr, size);
@@ -389,7 +388,33 @@ index 7e4833fdfe..da017a397e 100644
  
      pcm_data = addr;
      pcm_size = size;
-@@ -678,6 +850,8 @@ static void sink_dma_start(const void *addr, size_t size)
+ 
++    /* Reopen if there is no open handle, or if the configured playback
++     * device no longer matches the open one. A route switch (e.g. to a
++     * Bluetooth sink) updates playback_dev and may close the handle,
++     * expecting the next start to reopen on the new device; the device is
++     * otherwise only opened in sink_dma_init(). Handling it here makes the
++     * switch take effect on the very next buffer (covers both "switched
++     * while playing" and "connected then pressed play" orderings) and
++     * avoids dereferencing a NULL handle below. */
++    if (!handle || playback_dev != current_alsa_device)
++    {
++        RBTRACE("sink_dma_start: (re)open handle=%p cur='%s' want='%s'",
++                (void *)handle,
++                current_alsa_device ? current_alsa_device : "(null)",
++                playback_dev ? playback_dev : "(null)");
++        open_hwdev(playback_dev, SND_PCM_STREAM_PLAYBACK);
++        if (!handle)
++        {
++            RBTRACE("sink_dma_start: reopen failed, abort start");
++            return;
++        }
++    }
++
+ #if !defined(AUDIOHW_MUTE_ON_STOP) && defined(AUDIOHW_MUTE_ON_SRATE_CHANGE)
+     audiohw_mute(false);
+ #endif
+@@ -678,6 +872,8 @@ static void sink_dma_start(const void *addr, size_t size)
      {
          snd_pcm_state_t state = snd_pcm_state(handle);
          logf("PCM State %d", state);
@@ -398,7 +423,7 @@ index 7e4833fdfe..da017a397e 100644
  
          switch (state)
          {
-@@ -696,7 +870,9 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -696,7 +892,9 @@ static void sink_dma_start(const void *addr, size_t size)
              }
              case SND_PCM_STATE_SETUP:
              {
@@ -408,7 +433,7 @@ index 7e4833fdfe..da017a397e 100644
                  if (err < 0)
                      logf("Prepare error: %s", snd_strerror(err));
              }
-@@ -720,11 +896,16 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -720,11 +918,16 @@ static void sink_dma_start(const void *addr, size_t size)
                  }
  #else
                  /* Fill buffer with proper sample data */
@@ -426,7 +451,7 @@ index 7e4833fdfe..da017a397e 100644
                          if (err < 0 && err != period_size && err != -EAGAIN)
                          {
                              logf("Write error: written %i expected %li", err, period_size);
-@@ -732,8 +913,11 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -732,8 +935,11 @@ static void sink_dma_start(const void *addr, size_t size)
                          }
                      }
                  }
