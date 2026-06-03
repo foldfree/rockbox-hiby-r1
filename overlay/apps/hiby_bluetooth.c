@@ -1369,32 +1369,36 @@ static void bt_connect_device(const struct bt_device *device)
             sleep(HZ / 2);
     }
 
-    snprintf(cmd, sizeof(cmd), "BT:CONNECT:%s", mac);
-    ctl_rc = bt_sys_command(cmd, reply, sizeof(reply));
-    connect_reply_ok = (ctl_rc == 0) && bt_sys_reply_ok(reply, "BT:CONNECT");
-
     if (!pair_reply_ok && !device->paired)
     {
         splash(HZ * 2, "BT pair failed");
         return;
     }
 
-    if (!connect_reply_ok)
-    {
-        splash(HZ * 2, "BT connect failed");
-        return;
-    }
-
     bt_set_selected_mac(mac);
 
-    routed = bt_route_to_bluetooth(mac);
+    /* Connect via bluetoothctl FIRST. On-device testing showed a plain
+     * "bluetoothctl connect" cleanly negotiates AAC and keeps the A2DP PCM
+     * stable, whereas the HiBy sys_server "BT:CONNECT" tends to bring the
+     * link up on LDAC, which then forces a destructive codec switch
+     * (transport teardown -> "no route to audio" thrash). Connecting the
+     * clean way means the sink is already on AAC, so bt_apply_preferred_codec
+     * skips the switch entirely. Fall back to sys_server BT:CONNECT only if
+     * bluetoothctl fails to bring up the PCM. */
+    routed = false;
+    if (bt_connect_via_bluetoothctl(mac))
+    {
+        routed = bt_route_to_bluetooth(mac);
+    }
+
     if (!routed)
     {
-        /* sys_server BT:CONNECT linked the device but A2DP did not come
-         * up. Bring the audio profile up the reliable way and re-route. */
-        bt_dbg("connect: sys_server route failed, trying bluetoothctl for %s",
+        bt_dbg("connect: bluetoothctl route failed, trying sys_server for %s",
                mac);
-        if (bt_connect_via_bluetoothctl(mac))
+        snprintf(cmd, sizeof(cmd), "BT:CONNECT:%s", mac);
+        ctl_rc = bt_sys_command(cmd, reply, sizeof(reply));
+        connect_reply_ok = (ctl_rc == 0) && bt_sys_reply_ok(reply, "BT:CONNECT");
+        if (connect_reply_ok)
             routed = bt_route_to_bluetooth(mac);
     }
 
