@@ -1,4 +1,4 @@
-From fd9755f2294807c88edc70f7ee02c3779c779e2f Mon Sep 17 00:00:00 2001
+From 8205a0bcd4c47f5f68cca8261c15f20c483e1a74 Mon Sep 17 00:00:00 2001
 From: test <test@example.invalid>
 Date: Sun, 31 May 2026 20:24:50 +0100
 Subject: [PATCH 3/5] hibyr1: add platform PCM hooks and HiBy weak overrides
@@ -29,8 +29,8 @@ mutex and delegates. Without this definition the HiBy build failed to
 link (undefined reference to pcm_alsa_pump_locked).
 ---
  firmware/SOURCES                  |   3 +
- firmware/target/hosted/pcm-alsa.c | 310 +++++++++++++++++++++++++++---
- 2 files changed, 281 insertions(+), 32 deletions(-)
+ firmware/target/hosted/pcm-alsa.c | 261 ++++++++++++++++++++++++++----
+ 2 files changed, 232 insertions(+), 32 deletions(-)
 
 diff --git a/firmware/SOURCES b/firmware/SOURCES
 index 20158f8489..262369dc0b 100644
@@ -47,7 +47,7 @@ index 20158f8489..262369dc0b 100644
  #endif
  
 diff --git a/firmware/target/hosted/pcm-alsa.c b/firmware/target/hosted/pcm-alsa.c
-index 7e4833fdfe..cab12e9233 100644
+index 7e4833fdfe..8c315e2136 100644
 --- a/firmware/target/hosted/pcm-alsa.c
 +++ b/firmware/target/hosted/pcm-alsa.c
 @@ -35,6 +35,7 @@
@@ -58,25 +58,7 @@ index 7e4833fdfe..cab12e9233 100644
  #include <alsa/asoundlib.h>
  
  //#define LOGF_ENABLE
-@@ -57,6 +58,17 @@
- 
- #include <pthread.h>
- #include <signal.h>
-+#include <stdio.h>
-+
-+/* Temporary crash instrumentation: raw stderr trace, captured to
-+ * rockbox.log by the (logging) bootloader. Unbuffered so the last line
-+ * before a segfault is not lost. Remove once the BT playback crash is
-+ * diagnosed. */
-+#define RBTRACE(...) do { \
-+        fprintf(stderr, "RBTRACE: " __VA_ARGS__); \
-+        fputc('\n', stderr); \
-+        fflush(stderr); \
-+    } while (0)
- 
- /* plughw:0,0 works with both, however "default" is recommended.
-  * default doesnt seem to work with async callback but doesn't break
-@@ -111,8 +123,92 @@ static snd_pcm_stream_t current_alsa_mode;  /* SND_PCM_STREAM_PLAYBACK / _CAPTUR
+@@ -111,6 +112,87 @@ static snd_pcm_stream_t current_alsa_mode;  /* SND_PCM_STREAM_PLAYBACK / _CAPTUR
  
  static const char *current_alsa_device;
  
@@ -163,13 +145,8 @@ index 7e4833fdfe..cab12e9233 100644
 +
  void pcm_alsa_set_playback_device(const char *device)
  {
-+    RBTRACE("set_playback_device: '%s' (was '%s')",
-+            device ? device : "(null)",
-+            playback_dev ? playback_dev : "(null)");
      playback_dev = device;
- }
- 
-@@ -148,6 +244,8 @@ static int set_hwparams(snd_pcm_t *handle, unsigned long sampr)
+@@ -148,6 +230,8 @@ static int set_hwparams(snd_pcm_t *handle, unsigned long sampr)
          period_size = MIX_FRAME_SAMPLES;
      }
  
@@ -178,7 +155,7 @@ index 7e4833fdfe..cab12e9233 100644
      /* choose all parameters */
      err = snd_pcm_hw_params_any(handle, params);
      if (err < 0)
-@@ -241,7 +339,8 @@ static int set_swparams(snd_pcm_t *handle)
+@@ -241,7 +325,8 @@ static int set_swparams(snd_pcm_t *handle)
          goto error;
      }
      /* start the transfer when the buffer is half full */
@@ -188,7 +165,7 @@ index 7e4833fdfe..cab12e9233 100644
      if (err < 0)
      {
          logf("Unable to set start threshold mode for playback: %s", snd_strerror(err));
-@@ -381,20 +480,28 @@ static bool copy_frames(bool first)
+@@ -381,20 +466,26 @@ static bool copy_frames(bool first)
      return true;
  }
  
@@ -219,14 +196,12 @@ index 7e4833fdfe..cab12e9233 100644
 +     * flood the log and bury the crash. */
 +    if (state != last_traced_state)
 +    {
-+        RBTRACE("pump_locked handle=%p state=%d period=%ld frames=%p",
-+                (void *)handle, (int)state, (long)period_size, (void *)frames);
 +        last_traced_state = state;
 +    }
  
      if (state == SND_PCM_STATE_XRUN)
      {
-@@ -403,19 +510,29 @@ static void async_callback(snd_async_handler_t *ahandler)
+@@ -403,19 +494,29 @@ static void async_callback(snd_async_handler_t *ahandler)
          err = snd_pcm_recover(handle, -EPIPE, 0);
          if (err < 0) {
              logf("XRUN Recovery error: %s", snd_strerror(err));
@@ -259,34 +234,16 @@ index 7e4833fdfe..cab12e9233 100644
  #ifdef HAVE_RECORDING
      if (current_alsa_mode == SND_PCM_STREAM_PLAYBACK)
      {
-@@ -430,21 +547,25 @@ static void async_callback(snd_async_handler_t *ahandler)
-                 {
-                     logf("mid underrun!");
-                     xruns++;
-+                    RBTRACE("pump: UNDERRUN #%d (recovering)", xruns);
+@@ -433,7 +534,7 @@ static void async_callback(snd_async_handler_t *ahandler)
                      err = snd_pcm_recover(handle, -EPIPE, 0);
                      if (err < 0) {
                         logf("XRUN Recovery error: %s", snd_strerror(err));
 -                       goto abort;
-+                       RBTRACE("pump: recover FAILED %d", err);
 +                       return;
                      }
                      goto retry;
                  }
-                 else if (err != period_size)
-                 {
-                     logf("Write error: written %i expected %li", err, period_size);
-+                    RBTRACE("pump: short write %d (want %ld)", err, (long)period_size);
-                     break;
-                 }
-             }
-             else
-             {
-+                RBTRACE("pump: NO DATA from codec buffer (state=%d)", (int)state);
-                 logf("%s: No Data (%d).", __func__, state);
-                 break;
-             }
-@@ -463,7 +584,7 @@ static void async_callback(snd_async_handler_t *ahandler)
+@@ -463,7 +564,7 @@ static void async_callback(snd_async_handler_t *ahandler)
                  err = snd_pcm_recover(handle, -EPIPE, 0);
                  if (err < 0) {
                     logf("XRUN Recovery error: %s", snd_strerror(err));
@@ -295,7 +252,7 @@ index 7e4833fdfe..cab12e9233 100644
                  }
  		continue;  /* buffer contents trashed, no sense in trying to copy */
              }
-@@ -492,8 +613,24 @@ static void async_callback(snd_async_handler_t *ahandler)
+@@ -492,8 +593,24 @@ static void async_callback(snd_async_handler_t *ahandler)
              /* Depending on the error we might be SOL */
          }
      }
@@ -321,7 +278,7 @@ index 7e4833fdfe..cab12e9233 100644
      pthread_mutex_unlock(&pcm_mtx);
  }
  
-@@ -502,6 +639,7 @@ static void close_hwdev(void)
+@@ -502,6 +619,7 @@ static void close_hwdev(void)
      logf("closedev (%p)", handle);
  
      if (handle) {
@@ -329,7 +286,7 @@ index 7e4833fdfe..cab12e9233 100644
          snd_pcm_drain(handle);
  #ifdef AUDIOHW_MUTE_ON_STOP
          audiohw_mute(true);
-@@ -534,11 +672,13 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+@@ -534,11 +652,13 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
  
      logf("opendev %s (%p)", device, handle);
  
@@ -346,12 +303,11 @@ index 7e4833fdfe..cab12e9233 100644
      {
          return;
      }
-@@ -546,9 +686,32 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+@@ -546,9 +666,29 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
      /* Close old handle */
      close_hwdev();
  
 -    if ((err = snd_pcm_open(&handle, device, mode, 0)) < 0)
-+    RBTRACE("open_hwdev TRY dev=%s mode=%d", device ? device : "(null)", (int)mode);
 +
 +    /* Open the device. A hot-pluggable sink (e.g. a Bluetooth A2DP route)
 +     * can disappear between routing and open, so on failure ask the
@@ -367,8 +323,6 @@ index 7e4833fdfe..cab12e9233 100644
 +            panicf("%s(): Cannot open device %s: %s",
 +                   __func__, device, snd_strerror(err));
 +
-+        RBTRACE("open %s failed (%s); falling back to %s",
-+                device, snd_strerror(err), fallback);
 +        logf("open %s failed (%s); falling back to %s",
 +             device, snd_strerror(err), fallback);
 +        device = fallback;
@@ -381,7 +335,7 @@ index 7e4833fdfe..cab12e9233 100644
      }
      last_sample_rate = 0;
  
-@@ -571,19 +734,33 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+@@ -571,19 +711,31 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
          panicf("Unable to install alternative signal stack: %s", strerror(err));
      }
  
@@ -398,8 +352,6 @@ index 7e4833fdfe..cab12e9233 100644
      if (err < 0)
      {
 -        panicf("Unable to register async handler: %s", snd_strerror(err));
-+        RBTRACE("async handler unavailable (%s); relying on poll thread",
-+                snd_strerror(err));
 +        logf("async handler unavailable (%s); using poll thread", snd_strerror(err));
 +        ahandler = NULL;
      }
@@ -423,7 +375,7 @@ index 7e4833fdfe..cab12e9233 100644
      }
  
  #ifdef HAVE_RECORDING
-@@ -593,12 +770,23 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+@@ -593,6 +745,13 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
  #endif
      current_alsa_device = device;
  
@@ -432,22 +384,12 @@ index 7e4833fdfe..cab12e9233 100644
 +     * thread (which locks pcm_mtx and pumps the handle) can run. Starting
 +     * it earlier raced a half-initialised mutex/device on every route
 +     * switch and segfaulted. */
-+    RBTRACE("open_hwdev ok dev=%s handle=%p mode=%d; starting pump",
-+            device ? device : "(null)", (void *)handle, (int)mode);
 +    pcm_alsa_device_opened(handle, device, mode, &pcm_mtx);
 +
      atexit(alsadev_cleanup);
  }
  
- static void sink_dma_init(void)
- {
-     logf("PCM DMA Init");
-+    RBTRACE("sink_dma_init: playback_dev='%s'",
-+            playback_dev ? playback_dev : "(null)");
- 
-     audiohw_preinit();
- 
-@@ -652,12 +840,14 @@ static void sink_set_freq(uint16_t freq)
+@@ -652,12 +811,14 @@ static void sink_set_freq(uint16_t freq)
  
  static void sink_dma_stop(void)
  {
@@ -464,14 +406,7 @@ index 7e4833fdfe..cab12e9233 100644
  #ifdef AUDIOHW_MUTE_ON_STOP
      audiohw_mute(true);
  #endif
-@@ -666,10 +856,54 @@ static void sink_dma_stop(void)
- static void sink_dma_start(const void *addr, size_t size)
- {
-     logf("PCM DMA start (%p %d)", addr, size);
-+    RBTRACE("sink_dma_start enter addr=%p size=%zu handle=%p dev=%s",
-+            addr, size, (void *)handle,
-+            current_alsa_device ? current_alsa_device : "(null)");
- 
+@@ -670,6 +831,41 @@ static void sink_dma_start(const void *addr, size_t size)
      pcm_data = addr;
      pcm_size = size;
  
@@ -488,14 +423,9 @@ index 7e4833fdfe..cab12e9233 100644
 +    {
 +        unsigned long sampr;
 +
-+        RBTRACE("sink_dma_start: (re)open handle=%p cur='%s' want='%s'",
-+                (void *)handle,
-+                current_alsa_device ? current_alsa_device : "(null)",
-+                playback_dev ? playback_dev : "(null)");
 +        open_hwdev(playback_dev, SND_PCM_STREAM_PLAYBACK);
 +        if (!handle)
 +        {
-+            RBTRACE("sink_dma_start: reopen failed, abort start");
 +            return;
 +        }
 +
@@ -510,7 +440,6 @@ index 7e4833fdfe..cab12e9233 100644
 +         * back to the default freq). */
 +        sampr = real_sample_rate ? real_sample_rate
 +                                 : hw_freq_sampr[HW_FREQ_DEFAULT];
-+        RBTRACE("sink_dma_start: configuring new handle at %lu Hz", sampr);
 +        set_hwparams(handle, sampr);
 +        set_swparams(handle);
 +        last_sample_rate = sampr;
@@ -519,55 +448,16 @@ index 7e4833fdfe..cab12e9233 100644
  #if !defined(AUDIOHW_MUTE_ON_STOP) && defined(AUDIOHW_MUTE_ON_SRATE_CHANGE)
      audiohw_mute(false);
  #endif
-@@ -678,6 +912,8 @@ static void sink_dma_start(const void *addr, size_t size)
-     {
-         snd_pcm_state_t state = snd_pcm_state(handle);
-         logf("PCM State %d", state);
-+        RBTRACE("sink_dma_start loop state=%d handle=%p period=%ld frames=%p",
-+                (int)state, (void *)handle, (long)period_size, (void *)frames);
- 
-         switch (state)
-         {
-@@ -696,7 +932,9 @@ static void sink_dma_start(const void *addr, size_t size)
-             }
-             case SND_PCM_STATE_SETUP:
-             {
-+                RBTRACE("calling snd_pcm_prepare handle=%p", (void *)handle);
-                 int err = snd_pcm_prepare(handle);
-+                RBTRACE("snd_pcm_prepare -> %d", err);
-                 if (err < 0)
-                     logf("Prepare error: %s", snd_strerror(err));
-             }
-@@ -720,11 +958,16 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -720,7 +916,8 @@ static void sink_dma_start(const void *addr, size_t size)
                  }
  #else
                  /* Fill buffer with proper sample data */
 -                while (snd_pcm_avail_update(handle) >= period_size)
-+                RBTRACE("PREPARED: begin fill loop period=%ld frames=%p",
-+                        (long)period_size, (void *)frames);
 +                snd_pcm_sframes_t avail;
 +                while ((avail = snd_pcm_avail_update(handle)) >= period_size)
                  {
-+                    RBTRACE("avail_update=%ld; copy_frames+writei", (long)avail);
                      if (copy_frames(true))
                      {
-                         err = snd_pcm_writei(handle, frames, period_size);
-+                        RBTRACE("snd_pcm_writei -> %d", err);
-                         if (err < 0 && err != period_size && err != -EAGAIN)
-                         {
-                             logf("Write error: written %i expected %li", err, period_size);
-@@ -732,8 +975,11 @@ static void sink_dma_start(const void *addr, size_t size)
-                         }
-                     }
-                 }
-+                RBTRACE("fill loop done, last avail=%ld", (long)avail);
- #endif
-+                RBTRACE("calling snd_pcm_start handle=%p", (void *)handle);
-                 err = snd_pcm_start(handle);
-+                RBTRACE("snd_pcm_start -> %d", err);
-                 if (err < 0) {
-                     logf("start error: %s", snd_strerror(err));
-                     /* We will recover on the next iteration */
 -- 
 2.50.1 (Apple Git-155)
 

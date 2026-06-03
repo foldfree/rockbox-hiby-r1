@@ -11,6 +11,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <poll.h>
 #include <alsa/asoundlib.h>
 
 #include "panic.h"
@@ -188,19 +189,89 @@ static void hiby_pcm_mutex_init_once(pthread_mutex_t *mtx)
     hiby_pcm_mutex_initialized = true;
 }
 
+/* Wait until the PCM can accept more data, then pump. Instead of sleeping a
+ * fixed interval and polling blindly, ask ALSA for the device's poll
+ * descriptors and wait on them with poll(2) -- we wake exactly when the
+ * device is ready (or on a short timeout), which is lower-latency and avoids
+ * both busy-spinning and underruns from a too-long sleep.
+ *
+ * Everything that touches the handle is done under hiby_poll_mtx, and we use
+ * a bounded poll timeout so a concurrent route switch (which clears
+ * hiby_poll_handle / sets the stop flag) is always noticed within one
+ * quantum. If the descriptors can't be fetched (some plugins don't provide
+ * usable ones), we fall back to the original fixed-interval sleep+pump. */
 static void *hiby_pcm_poll_thread_fn(void *arg)
 {
     (void)arg;
 
+    /* Cap the poll wait so stop/route-switch is responsive even if the
+     * device never signals readiness. Derived from the computed interval. */
+    int max_wait_ms;
+
     while (!hiby_pcm_poll_thread_stop)
     {
+        struct pollfd pfds[8];
+        int nfds = 0;
+        bool pumped = false;
+
+        max_wait_ms = (int)(hiby_pcm_poll_interval_us / 1000);
+        if (max_wait_ms < 2)
+            max_wait_ms = 2;
+        if (max_wait_ms > 20)
+            max_wait_ms = 20;
+
         if (hiby_poll_handle && hiby_poll_mtx &&
             pthread_mutex_trylock(hiby_poll_mtx) == 0)
         {
-            pcm_alsa_pump_locked(hiby_poll_handle);
+            snd_pcm_t *h = hiby_poll_handle; /* may have changed; re-read */
+
+            if (h)
+            {
+                int count = snd_pcm_poll_descriptors_count(h);
+                if (count > 0 && count <= (int)(sizeof(pfds) / sizeof(pfds[0])))
+                    nfds = snd_pcm_poll_descriptors(h, pfds, count);
+
+                if (nfds > 0)
+                {
+                    /* poll() while NOT holding the mutex would race the
+                     * handle close, so poll with a short timeout while
+                     * holding it. The fds are level-triggered; a brief hold
+                     * is fine and keeps the handle alive for the pump. */
+                    int rc = poll(pfds, nfds, max_wait_ms);
+                    if (rc > 0)
+                    {
+                        unsigned short revents = 0;
+                        if (snd_pcm_poll_descriptors_revents(h, pfds, nfds,
+                                                             &revents) == 0 &&
+                            (revents & (POLLOUT | POLLERR)))
+                        {
+                            pcm_alsa_pump_locked(h);
+                            pumped = true;
+                        }
+                    }
+                    else if (rc == 0)
+                    {
+                        /* Timed out with nothing ready: pump anyway so we
+                         * recover from XRUN/PREPARED states the descriptors
+                         * may not flag. */
+                        pcm_alsa_pump_locked(h);
+                        pumped = true;
+                    }
+                }
+                else
+                {
+                    /* No usable descriptors: legacy behaviour. */
+                    pcm_alsa_pump_locked(h);
+                }
+            }
+
             pthread_mutex_unlock(hiby_poll_mtx);
         }
-        usleep(hiby_pcm_poll_interval_us);
+
+        /* If we waited inside poll() we've already paced ourselves; only
+         * sleep when we didn't (no handle, lock contended, or no fds). */
+        if (!pumped)
+            usleep(hiby_pcm_poll_interval_us);
     }
 
     return NULL;

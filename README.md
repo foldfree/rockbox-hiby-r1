@@ -15,12 +15,33 @@ This patch set enables **Bluetooth audio support** for Rockbox on the **HiBy R1*
 
 - a **Bluetooth menu** in Rockbox
 - device **scan, pair, connect, disconnect, and status**
-- playback routing to **BlueALSA A2DP**
+- a **Codec** menu (Auto / SBC / AAC / aptX / aptX-HD / LDAC), persisted
+- playback routing to **BlueALSA A2DP**, with working A2DP audio
 - fallback to **local audio output** on disconnect/failure
 - **absolute volume** updates from Rockbox to the Bluetooth stack
 - Bluetooth preserved across the **bootloader → Rockbox** handoff
 
 It also includes a small **USB/ADB** patch so ADB is handled through the existing USB mode path.
+
+### Bluetooth codec notes
+
+On connect, Rockbox starts BlueALSA offering only **SBC + AAC**. This is
+deliberate: on the R1, BlueALSA's **LDAC** encoder negotiates a 96 kHz A2DP
+transport that the device cannot open for playback, which presents as
+"connected, but no audio." Restricting the offered codecs means the sink
+negotiates **AAC** (48 kHz), which plays cleanly. LDAC remains visible in the
+Codec menu but is not offered by the daemon on this hardware.
+
+The audio data path uses a dedicated poll thread (driven by ALSA poll
+descriptors), because BlueALSA does not implement ALSA async (SIGIO)
+handlers.
+
+### Known issues
+
+- **Plugging in USB stops Bluetooth playback.** USB insertion triggers the
+  HiBy USB-gadget mode switch (per the `usb mode` setting, e.g. `adb`), which
+  reconfigures the gadget and interrupts audio. Charging while playing is not
+  currently supported; unplug and resume playback.
 
 ## Repository layout
 
@@ -90,6 +111,8 @@ git push origin v0.1.0
 
 ## Known Issues
 
-- Bluetooth connection setup currently forces the **SBC** codec.
-- Bluetooth support is still **flaky** and needs further testing. Expect issues with pairing, connecting, or routing audio.
-- **Music playback does work**, but the overall Bluetooth experience is not yet fully reliable.
+- **Plugging in USB stops Bluetooth playback** (USB-gadget mode switch); see
+  *Bluetooth codec notes → Known issues* above.
+- **LDAC** is not usable on this hardware (BlueALSA's LDAC encoder yields a
+  96 kHz transport that won't open); AAC is used instead.
+- Bluetooth audio (A2DP, AAC) works; report any pairing/connect edge cases.
