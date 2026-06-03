@@ -1250,10 +1250,41 @@ static bool bt_wait_for_bluealsa_pcm(const char *mac, int timeout_ticks)
     return bt_bluealsa_pcm_ready(mac);
 }
 
+/* The WH-1000XM5 (and other LDAC sinks) negotiate LDAC by default, but the
+ * R1's BlueALSA LDAC encoder produces a 96 kHz transport that cannot be
+ * opened for playback (verified on-device), giving "connected, no audio".
+ * The stock bt_init starts `bluealsa -p a2dp-source --a2dp-volume` offering
+ * ALL codecs including LDAC. Restart it offering only SBC+AAC so the sink
+ * can only pick a codec that actually plays (AAC@48k works). This is the
+ * root fix for the codec-teardown thrash; with LDAC never offered, no codec
+ * switch is needed at connect time. Idempotent: only restarts if the
+ * running daemon still offers LDAC. */
+static void bt_ensure_bluealsa_no_ldac(void)
+{
+    /* Already restricted (our marker file present and daemon alive)? skip. */
+    if (system("grep -q . /tmp/rb_bluealsa_restricted 2>/dev/null && "
+               "pgrep -f 'bluealsa -p a2dp-source' >/dev/null 2>&1") == 0)
+        return;
+
+    /* Kill whatever bluealsa is running and relaunch without LDAC. setsid +
+     * full redirection so it survives this process and does not hold the
+     * Rockbox stdio. */
+    system("killall bluealsa >/dev/null 2>&1");
+    sleep(HZ / 2);
+    system("setsid /usr/bin/bluealsa -p a2dp-source --a2dp-volume "
+           "-c SBC -c AAC >/tmp/rb_bluealsa.log 2>&1 </dev/null &");
+    sleep(HZ);                 /* let it acquire the D-Bus name */
+    system("echo 1 > /tmp/rb_bluealsa_restricted");
+    bt_dbg("bluealsa restarted with SBC+AAC only (LDAC disabled)");
+}
+
 static bool bt_prepare_stack(void)
 {
     char reply[BT_SYS_REPLY_MAX];
     int i;
+
+    /* Make sure bluealsa is not offering LDAC before we connect anything. */
+    bt_ensure_bluealsa_no_ldac();
 
     /* If the control socket already answers, the stack is up; skip the
      * heavyweight bt_enable which tears down and re-initialises the whole
