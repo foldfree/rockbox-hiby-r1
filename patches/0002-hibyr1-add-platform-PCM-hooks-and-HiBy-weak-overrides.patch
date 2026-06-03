@@ -1,4 +1,4 @@
-From a79eccbf3fbfbab7f6110f9d43212b348da3b29f Mon Sep 17 00:00:00 2001
+From d43a9842971a0ad9f442aa980cc5b9999948eb42 Mon Sep 17 00:00:00 2001
 From: test <test@example.invalid>
 Date: Sun, 31 May 2026 20:24:50 +0100
 Subject: [PATCH 3/5] hibyr1: add platform PCM hooks and HiBy weak overrides
@@ -29,8 +29,8 @@ mutex and delegates. Without this definition the HiBy build failed to
 link (undefined reference to pcm_alsa_pump_locked).
 ---
  firmware/SOURCES                  |   3 +
- firmware/target/hosted/pcm-alsa.c | 262 +++++++++++++++++++++++++++---
- 2 files changed, 241 insertions(+), 24 deletions(-)
+ firmware/target/hosted/pcm-alsa.c | 292 ++++++++++++++++++++++++++----
+ 2 files changed, 263 insertions(+), 32 deletions(-)
 
 diff --git a/firmware/SOURCES b/firmware/SOURCES
 index 20158f8489..262369dc0b 100644
@@ -47,7 +47,7 @@ index 20158f8489..262369dc0b 100644
  #endif
  
 diff --git a/firmware/target/hosted/pcm-alsa.c b/firmware/target/hosted/pcm-alsa.c
-index 7e4833fdfe..842b627785 100644
+index 7e4833fdfe..f7de1f2c3f 100644
 --- a/firmware/target/hosted/pcm-alsa.c
 +++ b/firmware/target/hosted/pcm-alsa.c
 @@ -35,6 +35,7 @@
@@ -226,7 +226,7 @@ index 7e4833fdfe..842b627785 100644
  
      if (state == SND_PCM_STATE_XRUN)
      {
-@@ -403,18 +510,28 @@ static void async_callback(snd_async_handler_t *ahandler)
+@@ -403,19 +510,29 @@ static void async_callback(snd_async_handler_t *ahandler)
          err = snd_pcm_recover(handle, -EPIPE, 0);
          if (err < 0) {
              logf("XRUN Recovery error: %s", snd_strerror(err));
@@ -244,20 +244,21 @@ index 7e4833fdfe..842b627785 100644
      {
 -        goto abort;
 +        return;
-     }
++    }
 +    else if (state == SND_PCM_STATE_DISCONNECTED)
 +    {
 +        /* Hot-pluggable sink (e.g. Bluetooth) went away mid-stream. Do
 +         * not touch the dead handle; the route layer will switch us back
 +         * to local output. */
 +        return;
-+    }
-+
+     }
+ 
 +    if (state == SND_PCM_STATE_OPEN || !pcm_alsa_params_ready(period_size, buffer_size, frames))
 +        return;
- 
++
  #ifdef HAVE_RECORDING
      if (current_alsa_mode == SND_PCM_STREAM_PLAYBACK)
+     {
 @@ -430,21 +547,25 @@ static void async_callback(snd_async_handler_t *ahandler)
                  {
                      logf("mid underrun!");
@@ -380,7 +381,49 @@ index 7e4833fdfe..842b627785 100644
      }
      last_sample_rate = 0;
  
-@@ -593,12 +756,23 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+@@ -571,19 +734,33 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
+         panicf("Unable to install alternative signal stack: %s", strerror(err));
+     }
+ 
++    /* Try to register the async (SIGIO) handler. Some ALSA backends -- the
++     * BlueALSA plugin in particular -- do not implement async handlers and
++     * return -ENOSYS ("Function not implemented"). That is NOT fatal here:
++     * the HiBy target pumps PCM from its own poll thread (started in
++     * pcm_alsa_device_opened), so the async handler is only a bonus path.
++     * Previously this panicked, but it only ever ran for the local DAC
++     * (which supports it); now that BT playback correctly opens the
++     * bluealsa device, panicking here would kill all BT audio. */
++    ahandler = NULL;
+     err = snd_async_add_pcm_handler(&ahandler, handle, async_callback, NULL);
+     if (err < 0)
+     {
+-        panicf("Unable to register async handler: %s", snd_strerror(err));
++        RBTRACE("async handler unavailable (%s); relying on poll thread",
++                snd_strerror(err));
++        logf("async handler unavailable (%s); using poll thread", snd_strerror(err));
++        ahandler = NULL;
+     }
+-
+-    /* only modify the stack the handler runs on */
+-    sigaction(SIGIO, NULL, &sa);
+-    sa.sa_flags |= SA_ONSTACK;
+-    err = sigaction(SIGIO, &sa, NULL);
+-    if (err < 0)
++    else
+     {
+-        panicf("Unable to install alternative signal stack: %s", strerror(err));
++        /* only modify the stack the handler runs on */
++        sigaction(SIGIO, NULL, &sa);
++        sa.sa_flags |= SA_ONSTACK;
++        err = sigaction(SIGIO, &sa, NULL);
++        if (err < 0)
++        {
++            panicf("Unable to install alternative signal stack: %s", strerror(err));
++        }
+     }
+ 
+ #ifdef HAVE_RECORDING
+@@ -593,12 +770,23 @@ static void open_hwdev(const char *device, snd_pcm_stream_t mode)
  #endif
      current_alsa_device = device;
  
@@ -404,7 +447,7 @@ index 7e4833fdfe..842b627785 100644
  
      audiohw_preinit();
  
-@@ -652,12 +826,14 @@ static void sink_set_freq(uint16_t freq)
+@@ -652,12 +840,14 @@ static void sink_set_freq(uint16_t freq)
  
  static void sink_dma_stop(void)
  {
@@ -421,7 +464,7 @@ index 7e4833fdfe..842b627785 100644
  #ifdef AUDIOHW_MUTE_ON_STOP
      audiohw_mute(true);
  #endif
-@@ -666,10 +842,36 @@ static void sink_dma_stop(void)
+@@ -666,10 +856,36 @@ static void sink_dma_stop(void)
  static void sink_dma_start(const void *addr, size_t size)
  {
      logf("PCM DMA start (%p %d)", addr, size);
@@ -458,7 +501,7 @@ index 7e4833fdfe..842b627785 100644
  #if !defined(AUDIOHW_MUTE_ON_STOP) && defined(AUDIOHW_MUTE_ON_SRATE_CHANGE)
      audiohw_mute(false);
  #endif
-@@ -678,6 +880,8 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -678,6 +894,8 @@ static void sink_dma_start(const void *addr, size_t size)
      {
          snd_pcm_state_t state = snd_pcm_state(handle);
          logf("PCM State %d", state);
@@ -467,7 +510,7 @@ index 7e4833fdfe..842b627785 100644
  
          switch (state)
          {
-@@ -696,7 +900,9 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -696,7 +914,9 @@ static void sink_dma_start(const void *addr, size_t size)
              }
              case SND_PCM_STATE_SETUP:
              {
@@ -477,7 +520,7 @@ index 7e4833fdfe..842b627785 100644
                  if (err < 0)
                      logf("Prepare error: %s", snd_strerror(err));
              }
-@@ -720,11 +926,16 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -720,11 +940,16 @@ static void sink_dma_start(const void *addr, size_t size)
                  }
  #else
                  /* Fill buffer with proper sample data */
@@ -495,7 +538,7 @@ index 7e4833fdfe..842b627785 100644
                          if (err < 0 && err != period_size && err != -EAGAIN)
                          {
                              logf("Write error: written %i expected %li", err, period_size);
-@@ -732,8 +943,11 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -732,8 +957,11 @@ static void sink_dma_start(const void *addr, size_t size)
                          }
                      }
                  }
