@@ -1,4 +1,4 @@
-From d43a9842971a0ad9f442aa980cc5b9999948eb42 Mon Sep 17 00:00:00 2001
+From fd9755f2294807c88edc70f7ee02c3779c779e2f Mon Sep 17 00:00:00 2001
 From: test <test@example.invalid>
 Date: Sun, 31 May 2026 20:24:50 +0100
 Subject: [PATCH 3/5] hibyr1: add platform PCM hooks and HiBy weak overrides
@@ -29,8 +29,8 @@ mutex and delegates. Without this definition the HiBy build failed to
 link (undefined reference to pcm_alsa_pump_locked).
 ---
  firmware/SOURCES                  |   3 +
- firmware/target/hosted/pcm-alsa.c | 292 ++++++++++++++++++++++++++----
- 2 files changed, 263 insertions(+), 32 deletions(-)
+ firmware/target/hosted/pcm-alsa.c | 310 +++++++++++++++++++++++++++---
+ 2 files changed, 281 insertions(+), 32 deletions(-)
 
 diff --git a/firmware/SOURCES b/firmware/SOURCES
 index 20158f8489..262369dc0b 100644
@@ -47,7 +47,7 @@ index 20158f8489..262369dc0b 100644
  #endif
  
 diff --git a/firmware/target/hosted/pcm-alsa.c b/firmware/target/hosted/pcm-alsa.c
-index 7e4833fdfe..f7de1f2c3f 100644
+index 7e4833fdfe..cab12e9233 100644
 --- a/firmware/target/hosted/pcm-alsa.c
 +++ b/firmware/target/hosted/pcm-alsa.c
 @@ -35,6 +35,7 @@
@@ -464,7 +464,7 @@ index 7e4833fdfe..f7de1f2c3f 100644
  #ifdef AUDIOHW_MUTE_ON_STOP
      audiohw_mute(true);
  #endif
-@@ -666,10 +856,36 @@ static void sink_dma_stop(void)
+@@ -666,10 +856,54 @@ static void sink_dma_stop(void)
  static void sink_dma_start(const void *addr, size_t size)
  {
      logf("PCM DMA start (%p %d)", addr, size);
@@ -486,6 +486,8 @@ index 7e4833fdfe..f7de1f2c3f 100644
 +    if (!handle || !current_alsa_device || !playback_dev ||
 +        strcmp(playback_dev, current_alsa_device) != 0)
 +    {
++        unsigned long sampr;
++
 +        RBTRACE("sink_dma_start: (re)open handle=%p cur='%s' want='%s'",
 +                (void *)handle,
 +                current_alsa_device ? current_alsa_device : "(null)",
@@ -496,12 +498,28 @@ index 7e4833fdfe..f7de1f2c3f 100644
 +            RBTRACE("sink_dma_start: reopen failed, abort start");
 +            return;
 +        }
++
++        /* A freshly opened handle is in SND_PCM_STATE_OPEN and has no hw/sw
++         * params, so it can never reach PREPARED/RUNNING on its own -> the
++         * state loop below would fall through to the default case and we'd
++         * get silence. The normal config path (sink_set_freq_nolock) only
++         * reconfigures when the sample rate *changes*, which it hasn't
++         * across a device switch, so it would skip this new handle. Apply
++         * hw/sw params here explicitly. open_hwdev() reset last_sample_rate
++         * to 0, so recover the active rate from real_sample_rate (falling
++         * back to the default freq). */
++        sampr = real_sample_rate ? real_sample_rate
++                                 : hw_freq_sampr[HW_FREQ_DEFAULT];
++        RBTRACE("sink_dma_start: configuring new handle at %lu Hz", sampr);
++        set_hwparams(handle, sampr);
++        set_swparams(handle);
++        last_sample_rate = sampr;
 +    }
 +
  #if !defined(AUDIOHW_MUTE_ON_STOP) && defined(AUDIOHW_MUTE_ON_SRATE_CHANGE)
      audiohw_mute(false);
  #endif
-@@ -678,6 +894,8 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -678,6 +912,8 @@ static void sink_dma_start(const void *addr, size_t size)
      {
          snd_pcm_state_t state = snd_pcm_state(handle);
          logf("PCM State %d", state);
@@ -510,7 +528,7 @@ index 7e4833fdfe..f7de1f2c3f 100644
  
          switch (state)
          {
-@@ -696,7 +914,9 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -696,7 +932,9 @@ static void sink_dma_start(const void *addr, size_t size)
              }
              case SND_PCM_STATE_SETUP:
              {
@@ -520,7 +538,7 @@ index 7e4833fdfe..f7de1f2c3f 100644
                  if (err < 0)
                      logf("Prepare error: %s", snd_strerror(err));
              }
-@@ -720,11 +940,16 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -720,11 +958,16 @@ static void sink_dma_start(const void *addr, size_t size)
                  }
  #else
                  /* Fill buffer with proper sample data */
@@ -538,7 +556,7 @@ index 7e4833fdfe..f7de1f2c3f 100644
                          if (err < 0 && err != period_size && err != -EAGAIN)
                          {
                              logf("Write error: written %i expected %li", err, period_size);
-@@ -732,8 +957,11 @@ static void sink_dma_start(const void *addr, size_t size)
+@@ -732,8 +975,11 @@ static void sink_dma_start(const void *addr, size_t size)
                          }
                      }
                  }
