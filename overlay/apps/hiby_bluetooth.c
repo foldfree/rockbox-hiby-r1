@@ -40,6 +40,7 @@
 
 #include "kernel.h"
 #include "audio.h"
+#include "metadata.h"   /* full struct mp3entry (elapsed/offset) for route restart */
 #include "menu.h"
 #include "splash.h"
 #include "gui/list.h"
@@ -976,15 +977,31 @@ static void bt_set_selected_mac(const char *mac)
         bt_selected_mac[0] = '\0';
 }
 
+/* Apply a playback-device change to any in-progress playback.
+ *
+ * pcm_alsa_switch_playback_device() only records the new device; the ALSA
+ * handle is reopened on the new device by the normal sink stop->start path
+ * (sink_dma_stop closes, sink_dma_start opens playback_dev). audio_pause/
+ * audio_resume do NOT reopen the device (they only pause the mixer channel),
+ * so to actually move a live stream to the new device we must stop and
+ * restart playback. Save the current elapsed position and restart there so
+ * the listener keeps their place (brief gap, same spot in the track). */
 static void bt_kick_audio_if_playing(void)
 {
+    struct mp3entry *id3;
+    unsigned long elapsed, offset;
     int status = audio_status();
-    if ((status & AUDIO_STATUS_PLAY) && !(status & AUDIO_STATUS_PAUSE))
-    {
-        audio_pause();
-        sleep(HZ / 4);
-        audio_resume();
-    }
+
+    if (!(status & AUDIO_STATUS_PLAY))
+        return;
+
+    id3 = audio_current_track();
+    elapsed = id3 ? id3->elapsed : 0;
+    offset  = id3 ? id3->offset  : 0;
+
+    audio_stop();
+    sleep(HZ / 5);
+    audio_play(elapsed, offset);
 }
 
 static void bt_route_to_local(bool show_message)
@@ -999,8 +1016,6 @@ static void bt_route_to_local(bool show_message)
 
 static bool bt_route_to_bluetooth(const char *mac)
 {
-    int attempt;
-
     if (!mac || !mac[0])
         return false;
 
@@ -1035,28 +1050,18 @@ static bool bt_route_to_bluetooth(const char *mac)
         sleep(HZ / 2);
     }
 
-    /* Opening the bluealsa ALSA device can transiently fail right after
-     * the transport is re-acquired. Retry a few times with backoff, and
-     * give up early only if the transport itself has disappeared. */
-    for (attempt = 1; attempt <= 3; attempt++)
-    {
-        if (pcm_alsa_switch_playback_device(bt_playback_dev) == 0)
-        {
-            hiby_pcm_set_bt_mac(mac);
-            bt_kick_audio_if_playing();
-            bt_dbg("route: ok for %s (attempt %d)", mac, attempt);
-            return true;
-        }
-
-        bt_dbg("route: device switch failed for %s (attempt %d)", mac, attempt);
-        sleep(HZ / 3);
-
-        if (!bt_wait_for_bluealsa_pcm(mac, HZ * 2))
-            break;
-    }
-
-    bt_route_to_local(false);
-    return false;
+    /* Record bluealsa as the playback device and apply it via a clean
+     * stop/start of the audio engine (bt_kick_audio_if_playing). The device
+     * is opened lazily on the next sink_dma_start, on the audio thread --
+     * we no longer open/close the live handle from here, which is what
+     * caused the route-switch races. The PCM is confirmed present above, so
+     * the open will succeed; if the sink later vanishes, the pump's
+     * DISCONNECTED handling + open fallback keep it from crashing. */
+    hiby_pcm_set_bt_mac(mac);
+    pcm_alsa_switch_playback_device(bt_playback_dev);
+    bt_kick_audio_if_playing();
+    bt_dbg("route: ok for %s (device=%s)", mac, bt_playback_dev);
+    return true;
 }
 
 static bool bt_is_connected(const char *mac)

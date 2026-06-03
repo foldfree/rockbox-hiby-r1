@@ -258,45 +258,21 @@ void pcm_alsa_device_closing(snd_pcm_t *handle, const char *device)
 
 /* Forward declare public API from pcm-alsa.c */
 void pcm_alsa_set_playback_device(const char *device);
-void pcm_alsa_restart_playback(void);
 
+/* Record the desired playback device only. The actual device open/close is
+ * driven entirely by the normal sink stop/start path (sink_dma_stop closes
+ * the handle, sink_dma_start opens playback_dev), so the caller must bracket
+ * a device change with a clean engine stop/start (see the BT route code).
+ *
+ * This function deliberately does NOT touch the live handle or the pump
+ * thread: doing so mid-stream (closing the handle the pump is using, then
+ * re-priming concurrently) was the source of the route-switch crashes and
+ * stalls. Keep it a pure setter. */
 int pcm_alsa_switch_playback_device(const char *device)
 {
     if (!device || !*device)
         return -1;
 
-    fprintf(stderr, "RBTRACE: switch_playback_device -> '%s' (poll_handle=%p)\n",
-            device, (void *)hiby_poll_handle);
-    fflush(stderr);
-
-    /* Set the new target device. */
     pcm_alsa_set_playback_device(device);
-
-    /* Tear down the current handle + pump, then reopen on the new device
-     * and resume playback in one step. The audio engine does NOT re-issue
-     * its .play call when we change devices under it, so we must drive the
-     * reopen+resume ourselves; just closing the handle here left playback
-     * dead (handle NULL, pump stopped, WPS stuck "playing"). Snapshot the
-     * globals first because hiby_pcm_stop_poll_thread() clears both
-     * hiby_poll_handle and hiby_poll_mtx (using them after would skip the
-     * close and call pthread_mutex_unlock(NULL) -> crash). */
-    {
-        snd_pcm_t *old_handle = hiby_poll_handle;
-        pthread_mutex_t *mtx = hiby_poll_mtx;
-
-        if (old_handle && mtx)
-        {
-            pthread_mutex_lock(mtx);
-            hiby_pcm_stop_poll_thread();
-            snd_pcm_drop(old_handle);
-            snd_pcm_close(old_handle);
-            pthread_mutex_unlock(mtx);
-        }
-    }
-
-    /* Reopen on the new device and resume the current stream (no-op if
-     * nothing is playing). pcm_alsa.c owns the handle/pump/engine glue. */
-    pcm_alsa_restart_playback();
-
     return 0;
 }
