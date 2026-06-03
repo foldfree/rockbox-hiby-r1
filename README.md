@@ -32,9 +32,10 @@ transport that the device cannot open for playback, which presents as
 negotiates **AAC** (48 kHz), which plays cleanly. LDAC remains visible in the
 Codec menu but is not offered by the daemon on this hardware.
 
-The audio data path uses a dedicated poll thread (driven by ALSA poll
-descriptors), because BlueALSA does not implement ALSA async (SIGIO)
-handlers.
+The audio data path uses a dedicated poll thread on a fixed interval,
+because BlueALSA does not implement ALSA async (SIGIO) handlers. (A
+poll-descriptor-driven variant was tried but regressed playback on this
+hardware, so the simple fixed-interval pump is used.)
 
 ### Known issues
 
