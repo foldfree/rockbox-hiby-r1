@@ -1,0 +1,11 @@
+#Winamp base skin - HiBy R1
+%X(sbsbackdrop.bmp)
+%Fl(3,winamp_text.fnt)
+
+# titlebar: current screen title (silver, centred on the inset navy panel)
+%V(146,8,188,14,3)
+%Vf(C8C8D0)
+%ac%?Lt<%Lt>
+
+# UI viewport: the menu/list area, inside the window frame
+%Vi(-,10,34,456,752,3)

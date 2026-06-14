@@ -1,0 +1,99 @@
+#Winamp Classic - HiBy R1
+%wd
+%X(backdrop.bmp)
+%Fl(2,winamp_lcd.fnt)
+%Fl(3,winamp_text.fnt)
+%Fl(4,22-Terminus-Bold.fnt)
+%xl(P,posbar_thumb.bmp,0,0)
+%xl(Q,posbar_groove.bmp,0,0)
+%Cl(0,0,467,440,c,c)
+
+# ============ WINAMP main window ============
+# titlebar text (silver, on the navy plate)
+%V(206,9,68,14,3)
+%Vf(C8C8D0)
+%acWINAMP
+
+# time (green LCD digits) - lowered within the vis box
+%V(40,45,116,24,2)
+%Vf(11FF33)
+%ac%pc
+
+# live stereo spectrum bars - fit within the vis grid (left x38, bottom y105), below the time
+%V(38,70,145,35,-)
+%pL(0,0,10,35,analyzer.bmp)
+%pR(12,0,10,35,analyzer.bmp)
+%pL(24,0,10,35,analyzer.bmp)
+%pR(36,0,10,35,analyzer.bmp)
+%pL(48,0,10,35,analyzer.bmp)
+%pR(60,0,10,35,analyzer.bmp)
+%pL(72,0,10,35,analyzer.bmp)
+%pR(84,0,10,35,analyzer.bmp)
+%pL(96,0,10,35,analyzer.bmp)
+%pR(108,0,10,35,analyzer.bmp)
+%pL(120,0,10,35,analyzer.bmp)
+%pR(132,0,10,35,analyzer.bmp)
+
+# scrolling title marquee (centred in its box, clipped at the box right edge x463)
+%V(192,44,271,13,3)
+%Vf(33EE33)
+%s%?it<%it|%fn>%?ia< - %ia|>
+
+# kbps readout (big, centred in its box) + label
+%V(188,78,59,26,4)
+%Vf(00FF00)
+%ac%fb
+%V(250,82,46,14,3)
+%Vf(B8B8C0)
+KBPS
+
+# kHz readout (big) + label
+%V(341,78,59,26,4)
+%Vf(00FF00)
+%ac%fk
+%V(403,82,40,14,3)
+%Vf(B8B8C0)
+KHZ
+
+# position groove + Winamp sliding thumb (no fill bar)
+%V(28,123,433,18,-)
+%pb(0,1,433,16,nobar,backdrop,Q,slider,P)
+
+# ============ WINAMP PLAYLIST window ============
+%V(162,220,156,14,3)
+%Vf(C8C8D0)
+%acWINAMP PLAYLIST
+
+# now-playing track: white-on-blue selection row (1. ARTIST - TITLE ... length)
+%V(16,247,396,14,3)
+%Vf(FFFFFF)
+%s1. %?ia<%ia - |>%?it<%it|%fn>
+%V(420,247,46,14,3)
+%Vf(FFFFFF)
+%ar%pt
+
+# playlist bottom line: battery (left) + elapsed/total time (right)
+%V(16,272,180,14,3)
+%Vf(00DD00)
+%alBAT: %bl%%
+%V(200,272,268,14,3)
+%Vf(00DD00)
+%ar%pc / %pt
+
+# ============ ALBUM ART window ============
+%V(194,322,92,14,3)
+%Vf(C8C8D0)
+%acALBUM ART
+
+# album cover, centred in the full-width window (nothing shown if no art)
+%V(6,344,467,440,-)
+%Cd
+
+# ============ touch zones ============
+%T(0,0,480,26,menu)
+%T(28,150,40,38,prev)
+%T(68,150,82,38,play)
+%T(148,150,40,38,stop)
+%T(188,150,52,38,next)
+%T(28,118,433,24,progressbar)
+%T(2,312,476,481,hotkey)
