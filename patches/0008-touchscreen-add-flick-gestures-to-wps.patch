@@ -1,0 +1,47 @@
+From a5890a609cf47175efa42aade80fe64cc3bf0b41 Mon Sep 17 00:00:00 2001
+From: Aidan MacDonald <amachronic@protonmail.com>
+Date: Tue, 12 Jul 2022 23:40:24 +0100
+Subject: [PATCH] touchscreen: Add flick gestures to WPS
+
+More hardcoded flick shortcuts for touchscreen targets, this time
+for the WPS. At present these can only be used if you are using a
+theme with touch support (theme .wps must have a %T tag present).
+
+Top    -> open quickscreen
+Left   -> go to file / database browser
+Right  -> view playlist
+Bottom -> context menu
+
+Change-Id: I70b79a79f5fdaef52fe53a9b60a8ccb055139d71
+---
+
+diff --git a/apps/gui/wps.c b/apps/gui/wps.c
+index 78e49ac..e19655d 100644
+--- a/apps/gui/wps.c
++++ b/apps/gui/wps.c
+@@ -171,6 +171,25 @@
+ {
+     int offset = 0;
+     struct gui_wps *gwps = skin_get_gwps(WPS, SCREEN_MAIN);
++
++    struct gesture_event gevent;
++    if (action_gesture_get_event(&gevent))
++    {
++        switch (gesture_flick_get(&gevent))
++        {
++        case GESTURE_FLICK_TOP:
++            return ACTION_WPS_QUICKSCREEN;
++        case GESTURE_FLICK_LEFT:
++            return ACTION_WPS_BROWSE;
++        case GESTURE_FLICK_RIGHT:
++            return ACTION_WPS_VIEW_PLAYLIST;
++        case GESTURE_FLICK_BOTTOM:
++            return ACTION_WPS_CONTEXT;
++        default:
++            break;
++        }
++    }
++
+     int button = skin_get_touchaction(gwps, &offset);
+     switch (button)
+     {

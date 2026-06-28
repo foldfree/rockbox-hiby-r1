@@ -1,0 +1,56 @@
+From 6fc272f811aaee01c1cd7deccf44985d10d6312c Mon Sep 17 00:00:00 2001
+From: Aidan MacDonald <amachronic@protonmail.com>
+Date: Tue, 12 Jul 2022 22:57:29 +0100
+Subject: [PATCH] touchscreen: Add flick gestures to list
+
+Add a few hardcoded shortcuts. These are the ones I find useful,
+but in the future these should be made configurable.
+
+Top   -> open quickscreen
+Left  -> go back
+Right -> go to the WPS
+
+Change-Id: I38e77265aa07cc11558b5b75048ffbbe593c3fb9
+---
+
+diff --git a/apps/gui/bitmap/list.c b/apps/gui/bitmap/list.c
+index 52b5d3d..9ff7570 100644
+--- a/apps/gui/bitmap/list.c
++++ b/apps/gui/bitmap/list.c
+@@ -712,6 +712,22 @@
+     return retval;
+ }
+ 
++
++static int list_do_flick(const struct gesture_event *gevent)
++{
++    switch (gesture_flick_get(gevent))
++    {
++    case GESTURE_FLICK_TOP:
++        return ACTION_STD_QUICKSCREEN;
++    case GESTURE_FLICK_LEFT:
++        return ACTION_STD_CANCEL;
++    case GESTURE_FLICK_RIGHT:
++        return ACTION_TREE_WPS;
++    default:
++        return ACTION_NONE;
++    }
++}
++
+ unsigned gui_synclist_do_touchscreen(struct gui_synclist *list)
+ {
+     struct touchevent tevent;
+@@ -813,6 +829,13 @@
+     case GESTURE_DRAG:
+         gesture_vel_process(&list_gvel, &tevent);
+ 
++        action = list_do_flick(&gevent);
++        if (action != ACTION_NONE)
++        {
++            action_gesture_reset();
++            break;
++        }
++
+         if (list->scroll_mode == SCROLL_NONE)
+         {
+             click_loc = get_click_location(list, gevent.ox, gevent.oy);
