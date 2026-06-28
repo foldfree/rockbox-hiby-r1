@@ -1,0 +1,64 @@
+name: Sync upstream Rockbox base commit
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # daily 04:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get current pinned commit
+        id: current
+        run: |
+          current=$(grep -oP 'ROCKBOX_BASE_COMMIT:-\K[a-f0-9]{40}' scripts/build.sh)
+          echo "commit=$current" >> "$GITHUB_OUTPUT"
+
+      - name: Get latest upstream commit
+        id: latest
+        run: |
+          latest=$(git ls-remote https://github.com/Rockbox/rockbox.git HEAD | cut -f1)
+          echo "commit=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Compare and test patch application
+        id: check
+        if: steps.current.outputs.commit != steps.latest.outputs.commit
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/rb-test
+          git init /tmp/rb-test
+          git -C /tmp/rb-test remote add origin https://github.com/Rockbox/rockbox.git
+          git -C /tmp/rb-test fetch --depth 1 origin "${{ steps.latest.outputs.commit }}"
+          git -C /tmp/rb-test checkout FETCH_HEAD
+          git -C /tmp/rb-test config user.name "sync-bot"
+          git -C /tmp/rb-test config user.email "ci@example.invalid"
+
+          for p in patches/*.patch; do
+            echo "Testing $p against new base..."
+            git -C /tmp/rb-test am "$p"
+          done
+          echo "all_patches_apply=true" >> "$GITHUB_OUTPUT"
+
+      - name: Bump pinned commit and push
+        if: steps.current.outputs.commit != steps.latest.outputs.commit && steps.check.outputs.all_patches_apply == 'true'
+        run: |
+          sed -i "s/ROCKBOX_BASE_COMMIT:-${{ steps.current.outputs.commit }}/ROCKBOX_BASE_COMMIT:-${{ steps.latest.outputs.commit }}/" scripts/build.sh
+          git config user.name "sync-bot"
+          git config user.email "ci@example.invalid"
+          git add scripts/build.sh
+          git commit -m "Bump ROCKBOX_BASE_COMMIT to ${{ steps.latest.outputs.commit }}"
+          git push origin main
+
+      - name: Report patch failure
+        if: failure()
+        run: |
+          echo "::error::One or more patches in patches/ failed to apply against new upstream commit ${{ steps.latest.outputs.commit }}. Manual rebase required before bump."
