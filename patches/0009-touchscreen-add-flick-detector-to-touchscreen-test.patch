@@ -1,10 +1,8 @@
-From b68a942dcd74ec790e72c593b9bca8b4134a8000 Mon Sep 17 00:00:00 2001
-From: test <test@test.invalid>
-Date: Sun, 28 Jun 2026 20:46:25 +0800
+From b76c46cfa0d6e822192ba3cfd7cc7e85fb9215f6 Mon Sep 17 00:00:00 2001
+From: fix <fix@test.invalid>
+Date: Tue, 30 Jun 2026 01:02:20 +0800
 Subject: [PATCH] touchscreen: Add flick detector to touchscreen test
 
-Original patch from rockbox gerrit 6792, manually resolved against
-font_measurestring conflict in apps/plugin.c and apps/plugin.h.
 ---
  apps/plugin.c                   |  4 +++
  apps/plugin.h                   |  5 +++
@@ -12,13 +10,13 @@ font_measurestring conflict in apps/plugin.c and apps/plugin.h.
  3 files changed, 63 insertions(+)
 
 diff --git a/apps/plugin.c b/apps/plugin.c
-index 336a18a..12b3c5f 100644
+index 98b9364..dd16335 100644
 --- a/apps/plugin.c
 +++ b/apps/plugin.c
 @@ -876,6 +876,10 @@ static const struct plugin_api rockbox_api = {
+ 
      /* new stuff at the end, sort into place next time
         the API gets incompatible */
-     font_measurestring,
 +#ifdef HAVE_TOUCHSCREEN
 +    gesture_flick_get_in_vp,
 +    gesture_flick_get,
@@ -27,13 +25,13 @@ index 336a18a..12b3c5f 100644
  
  static int plugin_buffer_handle;
 diff --git a/apps/plugin.h b/apps/plugin.h
-index 7ccc4b1..cc10371 100644
+index 584836e..4aaf42a 100644
 --- a/apps/plugin.h
 +++ b/apps/plugin.h
-@@ -1041,6 +1041,11 @@ struct plugin_api {
+@@ -1040,6 +1040,11 @@ struct plugin_api {
+ 
+     /* new stuff at the end, sort into place next time
         the API gets incompatible */
-     int (*font_measurestring)(const unsigned char *str, size_t maxbytes,
-                               size_t maxwidth, int *w, int *h, int fontnum);
 +#ifdef HAVE_TOUCHSCREEN
 +    int (*gesture_flick_get_in_vp)(const struct gesture_event *gevt,
 +                                   const struct viewport *vp);
@@ -43,10 +41,10 @@ index 7ccc4b1..cc10371 100644
  
  /* plugin header */
 diff --git a/apps/plugins/test_touchscreen.c b/apps/plugins/test_touchscreen.c
-index af130c4..3c9e559 100644
+index 97e1544..2ad3c98 100644
 --- a/apps/plugins/test_touchscreen.c
 +++ b/apps/plugins/test_touchscreen.c
-@@ -287,6 +287,55 @@ static void tstest_velocity(void)
+@@ -288,6 +288,55 @@ static void tstest_velocity(void)
      }
  }
  
@@ -102,7 +100,7 @@ index af130c4..3c9e559 100644
  /* plugin entry point */
  enum plugin_status plugin_start(const void* parameter)
  {
-@@ -299,6 +348,7 @@ enum plugin_status plugin_start(const void* parameter)
+@@ -300,6 +349,7 @@ enum plugin_status plugin_start(const void* parameter)
                          "Pointing mode test",
                          "Gesture test",
                          "Velocity test",
@@ -110,7 +108,7 @@ index af130c4..3c9e559 100644
                          "Quit");
  
      while (true)
-@@ -322,6 +372,10 @@ enum plugin_status plugin_start(const void* parameter)
+@@ -323,6 +373,10 @@ enum plugin_status plugin_start(const void* parameter)
              tstest_velocity();
              break;
  
