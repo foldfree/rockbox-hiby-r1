@@ -857,6 +857,58 @@ static void bt_route_to_local(bool show_message)
         splash(HZ, "Output: Local");
 }
 
+/* Force the A2DP transport onto a codec that can actually be opened for
+ * playback. LDAC sinks (e.g. the WH-1000XM5) negotiate LDAC by default, giving
+ * a 96 kHz transport that fails to open ("connected, no audio"); on this
+ * bluealsa build the `-c SBC -c AAC` offer-restriction does NOT suppress it
+ * (LDAC stays selectable and /usr/data/alsa.conf re-adds it). So switch the
+ * live transport here -- AAC (48 kHz) preferred, SBC (mandatory A2DP codec) as
+ * fallback. Called after connect and before any playback handle exists, so the
+ * renegotiation cannot race a live stream. Verified on-device: on AAC the PCM
+ * opens and audio reaches the sink. */
+static bool bt_force_playable_codec(const char *mac)
+{
+    static const char *const want[] = { "AAC", "SBC" };
+    char cur[24];
+    char path[96];
+    char cmd[200];
+    char mac_u[18];
+    unsigned w;
+    int i;
+
+    if (!mac || !*mac)
+        return false;
+
+    if (bt_read_active_codec(mac, cur, sizeof(cur)) &&
+        (strcmp(cur, "AAC") == 0 || strcmp(cur, "SBC") == 0))
+        return true;                    /* already on a playable codec */
+
+    bt_mac_to_underscore(mac, mac_u, sizeof(mac_u));
+    snprintf(path, sizeof(path),
+             "/org/bluealsa/hci0/dev_%s/a2dpsrc/sink", mac_u);
+
+    for (w = 0; w < sizeof(want) / sizeof(want[0]); w++)
+    {
+        snprintf(cmd, sizeof(cmd),
+                 "bluealsa-cli codec '%s' %s >/dev/null 2>&1", path, want[w]);
+        system(cmd);
+
+        for (i = 0; i < 20; i++)        /* wait for the transport to settle */
+        {
+            sleep(HZ / 5);
+            if (bt_read_active_codec(mac, cur, sizeof(cur)) &&
+                strcmp(cur, want[w]) == 0)
+            {
+                bt_dbg("codec: switched %s to %s after %d ticks",
+                       mac, want[w], i);
+                return true;
+            }
+        }
+        bt_dbg("codec: %s did not settle for %s (now=%s)", want[w], mac, cur);
+    }
+    return false;
+}
+
 static bool bt_route_to_bluetooth(const char *mac)
 {
     if (!mac || !mac[0])
@@ -871,11 +923,11 @@ static bool bt_route_to_bluetooth(const char *mac)
         return false;
     }
 
-    /* No codec switching here: bt_ensure_bluealsa_no_ldac() has restricted
-     * the daemon to SBC+AAC, so the sink always negotiates a codec that
-     * plays (AAC@48k). The previous per-connect "switch to preferred codec"
-     * step tore down and re-acquired the A2DP transport, which raced our
-     * route setup; removing it is what made BT audio reliable. */
+    /* The link may have come up on LDAC (96 kHz, unopenable). Switch the
+     * transport to a playable codec now -- before the device is handed to the
+     * audio engine and before any playback handle exists, so the codec
+     * renegotiation cannot race a live stream. */
+    bt_force_playable_codec(mac);
 
     /* Record bluealsa as the playback device and apply it via a clean
      * stop/start of the audio engine (bt_kick_audio_if_playing). The device
@@ -1077,32 +1129,76 @@ static bool bt_wait_for_bluealsa_pcm(const char *mac, int timeout_ticks)
     return bt_bluealsa_pcm_ready(mac);
 }
 
-/* The WH-1000XM5 (and other LDAC sinks) negotiate LDAC by default, but the
- * R1's BlueALSA LDAC encoder produces a 96 kHz transport that cannot be
- * opened for playback (verified on-device), giving "connected, no audio".
- * The stock bt_init starts `bluealsa -p a2dp-source --a2dp-volume` offering
- * ALL codecs including LDAC. Restart it offering only SBC+AAC so the sink
- * can only pick a codec that actually plays (AAC@48k works). This is the
- * root fix for the codec-teardown thrash; with LDAC never offered, no codec
- * switch is needed at connect time. Idempotent: only restarts if the
- * running daemon still offers LDAC. */
-static void bt_ensure_bluealsa_no_ldac(void)
-{
-    /* Already restricted (our marker file present and daemon alive)? skip. */
-    if (system("grep -q . /tmp/rb_bluealsa_restricted 2>/dev/null && "
-               "pgrep -f 'bluealsa -p a2dp-source' >/dev/null 2>&1") == 0)
-        return;
+/* --- bluealsa helpers & instrumentation --------------------------------- *
+ * We do NOT restart bluealsa to restrict codecs -- the `-c SBC -c AAC` flag
+ * does not suppress LDAC on this build. The stock bt_init already runs a
+ * bluealsa a2dp-source daemon; we only ensure one is running and let
+ * bt_force_playable_codec() switch the live transport to AAC after connect. */
 
-    /* Kill whatever bluealsa is running and relaunch without LDAC. setsid +
-     * full redirection so it survives this process and does not hold the
-     * Rockbox stdio. */
-    system("killall bluealsa >/dev/null 2>&1");
-    sleep(HZ / 2);
+/* Log the bluealsa daemon pid so its lifecycle across a connect is visible. */
+static void bt_log_bluealsa_state(const char *when)
+{
+    char pid[16] = "none";
+    FILE *fp = popen("pidof bluealsa 2>/dev/null", "r");
+    if (fp)
+    {
+        if (fgets(pid, sizeof(pid), fp))
+            pid[strcspn(pid, " \r\n")] = '\0';
+        pclose(fp);
+    }
+    bt_dbg("bluealsa[%s] pid=%s", when, pid);
+}
+
+/* Lightweight load/memory snapshot read straight from /proc (no process
+ * spawn), to correlate BT activity with the reported sluggishness. */
+static void bt_log_sys_stats(const char *when)
+{
+    char load[48] = "?";
+    char line[80];
+    long avail = -1;
+    FILE *fp = fopen("/proc/loadavg", "r");
+    if (fp)
+    {
+        if (fgets(load, sizeof(load), fp))
+            load[strcspn(load, "\r\n")] = '\0';
+        fclose(fp);
+    }
+    fp = fopen("/proc/meminfo", "r");
+    if (fp)
+    {
+        while (fgets(line, sizeof(line), fp))
+            if (sscanf(line, "MemAvailable: %ld kB", &avail) == 1)
+                break;
+        fclose(fp);
+    }
+    bt_dbg("sysstat[%s] load=%s memavail=%ldkB", when, load, avail);
+}
+
+/* Ensure a bluealsa a2dp-source daemon is running. The stock one (from
+ * bt_init) normally is; we only start one if none exists -- no kill/relaunch,
+ * so there is no daemon thrash. If we do start it, wait for hci0 UP first or
+ * it logs "Network is down" and never attaches. */
+static void bt_ensure_bluealsa_running(void)
+{
+    int i;
+
+    if (system("pidof bluealsa >/dev/null 2>&1") == 0)
+        return;                         /* already running -- leave it alone */
+
+    for (i = 0; i < 25; i++)
+    {
+        if (system("hciconfig hci0 2>/dev/null | grep -q 'UP RUNNING'") == 0)
+            break;
+        if (i == 0)
+            system("/usr/bin/bt_enable >/tmp/rb_bt_enable.log 2>&1");
+        sleep(HZ / 5);
+    }
+
     system("setsid /usr/bin/bluealsa -p a2dp-source --a2dp-volume "
-           "-c SBC -c AAC >/tmp/rb_bluealsa.log 2>&1 </dev/null &");
-    sleep(HZ);                 /* let it acquire the D-Bus name */
-    system("echo 1 > /tmp/rb_bluealsa_restricted");
-    bt_dbg("bluealsa restarted with SBC+AAC only (LDAC disabled)");
+           ">/tmp/rb_bluealsa.log 2>&1 </dev/null &");
+    sleep(HZ);
+    bt_log_bluealsa_state("started");
+    bt_dbg("bluealsa started (none was running)");
 }
 
 static bool bt_prepare_stack(void)
@@ -1110,8 +1206,8 @@ static bool bt_prepare_stack(void)
     char reply[BT_SYS_REPLY_MAX];
     int i;
 
-    /* Make sure bluealsa is not offering LDAC before we connect anything. */
-    bt_ensure_bluealsa_no_ldac();
+    /* Make sure a bluealsa a2dp-source daemon is up (it normally is). */
+    bt_ensure_bluealsa_running();
 
     /* If the control socket already answers, the stack is up; skip the
      * heavyweight bt_enable which tears down and re-initialises the whole
@@ -1203,7 +1299,6 @@ static void bt_connect_device(const struct bt_device *device)
     char reply[BT_SYS_REPLY_MAX];
     int ctl_rc;
     bool routed;
-    bool connect_reply_ok;
     bool pair_reply_ok = true;
 
     if (!device || !device->mac[0])
@@ -1211,6 +1306,8 @@ static void bt_connect_device(const struct bt_device *device)
 
     mac = device->mac;
     splash(0, "Connecting...");
+    bt_log_sys_stats("connect-begin");
+    bt_log_bluealsa_state("connect-begin");
 
     if (!bt_prepare_stack())
     {
@@ -1235,29 +1332,21 @@ static void bt_connect_device(const struct bt_device *device)
 
     bt_set_selected_mac(mac);
 
-    /* Connect via bluetoothctl FIRST. On-device testing showed a plain
-     * "bluetoothctl connect" cleanly negotiates AAC and keeps the A2DP PCM
-     * stable, whereas the HiBy sys_server "BT:CONNECT" tends to bring the
-     * link up on LDAC. With the daemon restricted to SBC+AAC (see
-     * bt_ensure_bluealsa_no_ldac) the sink lands on AAC either way, but the
-     * bluetoothctl path is the more reliable bring-up. Fall back to
-     * sys_server BT:CONNECT only if bluetoothctl fails to bring up the PCM. */
+    /* Connect via bluetoothctl -- the single, reliable bring-up. On-device
+     * testing showed a plain "bluetoothctl connect" cleanly negotiates the
+     * link; bt_route_to_bluetooth() then forces the transport to a playable
+     * codec (see bt_force_playable_codec). There is deliberately no sys_server
+     * fallback (see note below). */
     routed = false;
     if (bt_connect_via_bluetoothctl(mac))
-    {
         routed = bt_route_to_bluetooth(mac);
-    }
+    bt_log_bluealsa_state("after-route");
 
-    if (!routed)
-    {
-        bt_dbg("connect: bluetoothctl route failed, trying sys_server for %s",
-               mac);
-        snprintf(cmd, sizeof(cmd), "BT:CONNECT:%s", mac);
-        ctl_rc = bt_sys_command(cmd, reply, sizeof(reply));
-        connect_reply_ok = (ctl_rc == 0) && bt_sys_reply_ok(reply, "BT:CONNECT");
-        if (connect_reply_ok)
-            routed = bt_route_to_bluetooth(mac);
-    }
+    /* No sys_server BT:CONNECT fallback. It re-engages the stock orchestration
+     * (BT:A2DPPROFILE / bluealsa_profile) which kills and relaunches bluealsa,
+     * tearing down the A2DP transport we just brought up -- the connect/
+     * no-audio thrash and its CPU churn. bluetoothctl is the reliable bring-up;
+     * if it fails we report it rather than fight the stock stack. */
 
     if (routed)
     {
@@ -1266,6 +1355,8 @@ static void bt_connect_device(const struct bt_device *device)
     }
     else
         splash(HZ * 2, "BT connected, no audio route");
+
+    bt_log_sys_stats("connect-end");
 }
 
 static void bt_reconnect_last(void)
