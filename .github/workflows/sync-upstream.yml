@@ -42,7 +42,7 @@ jobs:
           git -C /tmp/rb-test config user.name "sync-bot"
           git -C /tmp/rb-test config user.email "ci@example.invalid"
 
-          for p in patches/*.patch; do
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
             echo "Testing $p against new base..."
             git -C /tmp/rb-test am "$p"
           done
