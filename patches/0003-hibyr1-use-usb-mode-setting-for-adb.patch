@@ -1,7 +1,7 @@
-From 395f1039d14324cb572e82daa6981863e5887d29 Mon Sep 17 00:00:00 2001
-From: Codex <codex@example.invalid>
+From 72a613791cf39320490d75578af8ba0bf56ee034 Mon Sep 17 00:00:00 2001
+From: Michael McAllister <me@michaelmcallister.org>
 Date: Sun, 8 Mar 2026 17:50:16 +0000
-Subject: [PATCH 4/5] hibyr1: use USB mode setting for ADB
+Subject: [PATCH 3/5] hibyr1: use USB mode setting for ADB
 
 ---
  firmware/target/hosted/hiby/usb-hiby-gadget.c | 53 +++++++++----------
