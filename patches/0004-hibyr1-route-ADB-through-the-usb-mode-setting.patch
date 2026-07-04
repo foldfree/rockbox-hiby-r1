@@ -1,14 +1,26 @@
-From 72a613791cf39320490d75578af8ba0bf56ee034 Mon Sep 17 00:00:00 2001
+From c5e800d1a0ba3f4fb3ba74bb0303723a3e60ee17 Mon Sep 17 00:00:00 2001
 From: Michael McAllister <me@michaelmcallister.org>
-Date: Sun, 8 Mar 2026 17:50:16 +0000
-Subject: [PATCH 3/5] hibyr1: use USB mode setting for ADB
+Date: Thu, 2 Jul 2026 20:57:29 +0100
+Subject: [PATCH 4/5] hibyr1: route ADB through the usb-mode setting
 
+Handle ADB as a first-class USB mode (USB_MODE_ADB -> enable_adb())
+driven by the usb-mode setting, instead of the out-of-band is_adb_running
+flag that was probed from configfs at init and consulted in
+enable_mass_storage().
+
+hiby_set_usb_mode() now no-ops when the mode is unchanged, and otherwise
+detaches the UDC before mutating the gadget and reattaches after (except
+in charge mode, with a short settle before bind), so switching between
+ADB / mass storage / charge works live. configfs rejects linking/unlinking
+functions while the UDC is bound (EBUSY), which previously wedged the
+switch until a reboot. Relies on the UDC-unbind fix in the preceding
+commit.
 ---
- firmware/target/hosted/hiby/usb-hiby-gadget.c | 53 +++++++++----------
- 1 file changed, 26 insertions(+), 27 deletions(-)
+ firmware/target/hosted/hiby/usb-hiby-gadget.c | 48 +++++++++++--------
+ 1 file changed, 27 insertions(+), 21 deletions(-)
 
 diff --git a/firmware/target/hosted/hiby/usb-hiby-gadget.c b/firmware/target/hosted/hiby/usb-hiby-gadget.c
-index 91e178dd03..8c386b1263 100644
+index 2e8806941f..e3a1e05a71 100644
 --- a/firmware/target/hosted/hiby/usb-hiby-gadget.c
 +++ b/firmware/target/hosted/hiby/usb-hiby-gadget.c
 @@ -42,7 +42,6 @@
@@ -19,13 +31,11 @@ index 91e178dd03..8c386b1263 100644
  
  void enable_adb(void);
  void enable_mass_storage(void);
-@@ -59,12 +58,24 @@ void startup_rbhome(void);
+@@ -59,12 +58,23 @@ void startup_rbhome(void);
  #endif
  
  void hiby_set_usb_mode(int mode) {
 -    logf(">>>>>>>>>>>>>>>>> hiby_set_usb_mode(%d)\n", mode);
-+    bool reattach;
-+
      if (!_usb_init) {
 -        logf("Need to init usb!\n");
          usb_init_device();
@@ -37,16 +47,17 @@ index 91e178dd03..8c386b1263 100644
 +    }
 +
 +    logf(">>>>>>>>>>>>>>>>> hiby_set_usb_mode(%d)\n", mode);
-+    reattach = (_usb_mode != -1 && usb_detect() == USB_INSERTED);
 +
-+    if (reattach) {
-+        usb_enable(false);
-+    }
++    /* Always detach before mutating the gadget: configfs rejects linking/
++     * unlinking functions on a config while the UDC is bound (EBUSY), which
++     * silently wedged the mode switch (it only took effect after a reboot).
++     * Unbinding when already unbound is harmless. */
++    usb_enable(false);
 +
      switch(mode) {
      case USB_MODE_MASS_STORAGE:
          logf("Enabling Mass Storage\n");
-@@ -74,11 +85,19 @@ void hiby_set_usb_mode(int mode) {
+@@ -74,11 +84,23 @@ void hiby_set_usb_mode(int mode) {
          logf("Enabling Charge\n");
          enable_charging();
          break;
@@ -61,28 +72,17 @@ index 91e178dd03..8c386b1263 100644
  
      _usb_mode = mode;
 +
-+    if (reattach && mode != USB_MODE_CHARGE) {
++    if (mode != USB_MODE_CHARGE) {
++        /* Let function daemons (adbd writing its f_fs descriptors) settle
++         * before binding. Binding with no cable present is harmless -- the
++         * UDC waits for VBUS. */
++        usleep(500000);
 +        usb_enable(true);
 +    }
  }
  
  /* TODO: implement usb detection properly */
-@@ -95,12 +114,8 @@ void usb_enable(bool on)
-     logf(">>>>>>>>>>>>>>>>> usb_enable(%d)\n", on);
-     logf("usb enable %d %d\n", on, _usb_mode);
- 
--    /* Ignore usb enable/disable when ADB is enabled so we can fireup adb shell
--     * without entering ums mode
--     */
--    //if (_usb_mode != USB_MODE_ADB) {
--        sysfs_set_string("/sys/kernel/config/usb_gadget/adb_demo/UDC", on ? "13500000.otg_new" : "");
--    //}
-+    sysfs_set_string("/sys/kernel/config/usb_gadget/adb_demo/UDC",
-+                     on ? "13500000.otg_new" : "");
- }
- 
- /* This is called by usb thread after usb extract in order to return
-@@ -221,11 +236,7 @@ void enable_mass_storage(void) {
+@@ -222,11 +244,7 @@ void enable_mass_storage(void) {
      system("mkdir -p /sys/kernel/config/usb_gadget/adb_demo/functions/mass_storage.0/lun.0");
      system("mkdir -p /sys/kernel/config/usb_gadget/adb_demo/configs/c.1/strings/0x409");
  
@@ -95,7 +95,7 @@ index 91e178dd03..8c386b1263 100644
      sysfs_set_int("/sys/kernel/config/usb_gadget/adb_demo/configs/c.1/MaxPower", 120);
  
      system("ln -s /sys/kernel/config/usb_gadget/adb_demo/functions/mass_storage.0 /sys/kernel/config/usb_gadget/adb_demo/configs/c.1/");
-@@ -284,8 +295,6 @@ void usb_init_device(void)
+@@ -285,8 +303,6 @@ void usb_init_device(void)
          return;
      }
  
@@ -104,7 +104,7 @@ index 91e178dd03..8c386b1263 100644
      /* Before we can do anything here we need to mount configfs */
      int is_mounted = !system("mountpoint -q /sys/kernel/config");
  
-@@ -307,16 +316,6 @@ void usb_init_device(void)
+@@ -308,16 +324,6 @@ void usb_init_device(void)
  
      system("mkdir -p /sys/kernel/config/usb_gadget/adb_demo/configs/c.1/strings/0x409");
  

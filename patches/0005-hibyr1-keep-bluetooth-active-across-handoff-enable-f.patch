@@ -1,7 +1,7 @@
-From 04505b495c7942d5633d13c8a65659b003aa972c Mon Sep 17 00:00:00 2001
+From 96da3e19c45c169d43c63f2ac396265f080f16a8 Mon Sep 17 00:00:00 2001
 From: Michael McAllister <me@michaelmcallister.org>
 Date: Sun, 8 Mar 2026 19:15:00 +0000
-Subject: [PATCH 4/5] hibyr1: keep bluetooth active across handoff; enable+fix
+Subject: [PATCH 5/5] hibyr1: keep bluetooth active across handoff; enable+fix
  bootloader logging
 
 Bootloader (hibyos_linux.c) changes for the R1:
