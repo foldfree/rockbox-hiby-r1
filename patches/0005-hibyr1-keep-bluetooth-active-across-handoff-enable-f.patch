@@ -1,5 +1,5 @@
-From 97db03dbfa75d7b8ecc865a2ca127efa0c949c01 Mon Sep 17 00:00:00 2001
-From: rockbox-hiby-r1-ci <ci@example.invalid>
+From 96da3e19c45c169d43c63f2ac396265f080f16a8 Mon Sep 17 00:00:00 2001
+From: Michael McAllister <me@michaelmcallister.org>
 Date: Sun, 8 Mar 2026 19:15:00 +0000
 Subject: [PATCH 5/5] hibyr1: keep bluetooth active across handoff; enable+fix
  bootloader logging
@@ -18,8 +18,6 @@ Bootloader (hibyos_linux.c) changes for the R1:
    captured for post-mortem. Pairs with the shipped unstripped rockbox.elf.
 
 Requires a full r1_rb.upt flash (bootloader is on read-only squashfs).
-
-Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
  bootloader/hibyos_linux.c | 47 +++++++++++++++++++++++----------------
  1 file changed, 28 insertions(+), 19 deletions(-)

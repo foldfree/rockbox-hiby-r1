@@ -99,31 +99,6 @@ void pcm_alsa_adjust_buffering(snd_pcm_sframes_t *period_size_ptr,
     *buffer_size_ptr = *period_size_ptr * 8;
 }
 
-/* Calculate poll interval for custom poll thread */
-unsigned int pcm_alsa_calc_poll_interval(unsigned int sample_rate,
-                                          snd_pcm_sframes_t period_size_val,
-                                          const char *device)
-{
-    unsigned int interval_us;
-
-    if (sample_rate == 0 || period_size_val <= 0)
-        return 10000;
-
-    interval_us = (unsigned int)((period_size_val * 1000000ULL) / sample_rate);
-
-    /* Poll more aggressively for Bluetooth */
-    if (hiby_pcm_is_bluealsa_device(device))
-        interval_us /= 2;
-
-    if (interval_us < 2000)
-        interval_us = 2000;
-    if (interval_us > 50000)
-        interval_us = 50000;
-
-    hiby_pcm_poll_interval_us = interval_us;
-    return interval_us;
-}
-
 /* Adjust start threshold for Bluetooth devices */
 snd_pcm_uframes_t pcm_alsa_start_threshold(snd_pcm_sframes_t buffer_size_val,
                                             snd_pcm_sframes_t period_size_val,
@@ -145,28 +120,29 @@ bool pcm_alsa_params_ready(snd_pcm_sframes_t period_size_val,
     return frames_ptr != NULL;
 }
 
-/* Decide whether to keep existing device or reopen */
-bool pcm_alsa_keep_device(const char *device, snd_pcm_stream_t mode,
-                          const char *current_device, snd_pcm_t *handle
-#ifdef HAVE_RECORDING
-                          , snd_pcm_stream_t current_mode
-#endif
-                          )
+/* Decide whether to keep existing device or reopen. Signature must match the
+ * weak prototype in pcm-alsa.c exactly (same argument order and arity), since
+ * the two translation units are linked by symbol name only. */
+bool pcm_alsa_keep_device(snd_pcm_t *handle, const char *device,
+                          const char *current_device,
+                          snd_pcm_stream_t mode, snd_pcm_stream_t current_mode)
 {
+    (void)mode;
+    (void)current_mode;
+
     if (!device || !*device)
         panicf("pcm_alsa_keep_device: Invalid empty ALSA device");
 
     /* Compare by string, not pointer: the BT route device string lives in a
      * rotating buffer, so the same logical device can have a different
-     * pointer between calls. A pointer compare would wrongly keep/repoen. */
-    if (!(handle && current_device && strcmp(device, current_device) == 0
-#ifdef HAVE_RECORDING
-          && current_mode == mode
-#endif
-         ))
-    {
+     * pointer between calls. A pointer compare would wrongly keep/reopen. */
+    if (!(handle && current_device && strcmp(device, current_device) == 0))
         return false;
-    }
+
+#ifdef HAVE_RECORDING
+    if (current_mode != mode)
+        return false;
+#endif
 
     /* Check device is still connected */
     return snd_pcm_state(handle) != SND_PCM_STATE_DISCONNECTED;
@@ -192,9 +168,8 @@ static void hiby_pcm_mutex_init_once(pthread_mutex_t *mtx)
  * tried (wake on snd_pcm_poll_descriptors() readiness) but broke playback on
  * device, so we keep this simple, proven fixed-interval sleep+pump. BlueALSA
  * does not implement ALSA async (SIGIO) handlers, so a poll thread is the
- * mechanism; the interval is computed per device in
- * pcm_alsa_calc_poll_interval(). All handle access is under hiby_poll_mtx,
- * via trylock so the thread stays responsive to stop/route-switch. */
+ * mechanism. All handle access is under hiby_poll_mtx, via trylock so the
+ * thread stays responsive to stop/route-switch. */
 static void *hiby_pcm_poll_thread_fn(void *arg)
 {
     (void)arg;
